@@ -1,0 +1,56 @@
+# ========================
+# Secrets & API Keys
+# ========================
+config/env_prod.properties
+config/env_dev.properties
+config/env_test.properties
+*.key
+*.pem
+.env
+
+# ========================
+# Data (runtime generated)
+# ========================
+data/
+
+# ========================
+# Python
+# ========================
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.egg
+
+# ========================
+# IDE
+# ========================
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ========================
+# Jupyter Notebooks
+# ========================
+.ipynb_checkpoints/
+
+# ========================
+# OS
+# ========================
+.DS_Store
+Thumbs.db
+
+# ========================
+# Testing
+# ========================
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+tests/test_data/
