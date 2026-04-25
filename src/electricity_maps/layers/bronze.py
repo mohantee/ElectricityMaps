@@ -14,32 +14,18 @@ import time
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 
-import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 import s3fs
 
 from electricity_maps.api.client import ElectricityMapsClient
 from electricity_maps.config import Settings, get_settings
+from electricity_maps.utils.helpers import floor_to_hour, get_s3fs
 from electricity_maps.utils.logging import get_logger
 from electricity_maps.utils.partitioning import build_bronze_key
 from electricity_maps.utils.state import PipelineState
 
 logger = get_logger(__name__)
-
-
-def _floor_to_hour(dt: datetime) -> datetime:
-    """Floor a datetime to the start of its hour."""
-    return dt.replace(minute=0, second=0, microsecond=0)
-
-
-def _get_s3fs(settings: Settings) -> s3fs.S3FileSystem:
-    """Build an authenticated S3FileSystem."""
-    return s3fs.S3FileSystem(
-        key=settings.aws_access_key_id,
-        secret=settings.aws_secret_access_key,
-        client_kwargs={"region_name": settings.aws_region},
-    )
 
 
 def _calculate_time_range(
@@ -57,12 +43,12 @@ def _calculate_time_range(
     last_end = state.get_last_end_timestamp("bronze")
 
     if last_end is not None:
-        start = _floor_to_hour(last_end)
+        start = floor_to_hour(last_end)
     else:
-        start = _floor_to_hour(datetime.now(timezone.utc) - timedelta(hours=24))
+        start = floor_to_hour(datetime.now(timezone.utc) - timedelta(hours=24))
         logger.info("no_prior_run", defaulting_start_to=str(start))
 
-    end = _floor_to_hour(datetime.now(timezone.utc))
+    end = floor_to_hour(datetime.now(timezone.utc))
 
     # Ensure we have at least 1 hour to fetch
     if start >= end:
@@ -75,12 +61,23 @@ def _write_parquet_to_s3(
     data: dict,
     s3_key: str,
     fs: s3fs.S3FileSystem,
+    *,
+    process_ts: int,
+    ingestion_ts: datetime,
+    source_url: str,
+    zone: str,
+    start: datetime,
+    end: datetime,
 ) -> None:
-    """Serialize a dict as a single-row Parquet file and write to S3."""
-    # Store the entire API response as a JSON string column
-    # alongside metadata columns for queryability
+    """Serialize one raw API response plus metadata columns to S3."""
     json_bytes = json.dumps(data, default=str).encode("utf-8")
     table = pa.table({
+        "process_ts": [process_ts],
+        "ingestion_timestamp": [ingestion_ts],
+        "source_url": [source_url],
+        "zone": [zone],
+        "range_start": [start],
+        "range_end": [end],
         "raw_json": [json_bytes.decode("utf-8")],
         "record_count": [len(data.get("data", []))],
     })
@@ -93,25 +90,6 @@ def _write_parquet_to_s3(
         f.write(buf.read())
 
 
-def _build_metadata_envelope(
-    raw: dict,
-    source_url: str,
-    zone: str,
-    start: datetime,
-    end: datetime,
-    ingestion_ts: datetime,
-) -> dict:
-    """Wrap raw API response with ingestion metadata."""
-    raw["_metadata"] = {
-        "ingestion_timestamp": ingestion_ts.isoformat(),
-        "source_url": source_url,
-        "zone": zone,
-        "start": start.isoformat(),
-        "end": end.isoformat(),
-    }
-    return raw
-
-
 def ingest_bronze(
     settings: Settings | None = None,
     process_ts: int | None = None,
@@ -121,7 +99,7 @@ def ingest_bronze(
     1. Write ``el_state`` entry with ``status=I``
     2. Calculate time range (catch-up aware)
     3. Fetch mix + flows from API
-    4. Add metadata envelope
+    4. Build metadata columns
     5. Write Parquet files to S3
     6. Update ``el_state`` to ``R``
 
@@ -159,7 +137,7 @@ def ingest_bronze(
             flows_records=flows_count,
         )
 
-        # Step 4: Add metadata
+        # Step 4: Build metadata values stored outside raw_json
         mix_url = (
             f"{settings.api_base_url}/electricity-mix/past-range"
             f"?zone={settings.zone}&start={start.isoformat()}&end={end.isoformat()}"
@@ -168,15 +146,9 @@ def ingest_bronze(
             f"{settings.api_base_url}/electricity-flows/past-range"
             f"?zone={settings.zone}&start={start.isoformat()}&end={end.isoformat()}"
         )
-        raw_mix = _build_metadata_envelope(
-            raw_mix, mix_url, settings.zone, start, end, ingestion_ts,
-        )
-        raw_flows = _build_metadata_envelope(
-            raw_flows, flows_url, settings.zone, start, end, ingestion_ts,
-        )
 
         # Step 5: Write to S3
-        fs = _get_s3fs(settings)
+        fs = get_s3fs(settings)
         mix_key = build_bronze_key(
             settings.bronze_dir, "electricity_mix",
             settings.zone, process_ts, ingestion_ts,
@@ -186,8 +158,28 @@ def ingest_bronze(
             settings.zone, process_ts, ingestion_ts,
         )
 
-        _write_parquet_to_s3(raw_mix, mix_key, fs)
-        _write_parquet_to_s3(raw_flows, flows_key, fs)
+        _write_parquet_to_s3(
+            raw_mix,
+            mix_key,
+            fs,
+            process_ts=process_ts,
+            ingestion_ts=ingestion_ts,
+            source_url=mix_url,
+            zone=settings.zone,
+            start=start,
+            end=end,
+        )
+        _write_parquet_to_s3(
+            raw_flows,
+            flows_key,
+            fs,
+            process_ts=process_ts,
+            ingestion_ts=ingestion_ts,
+            source_url=flows_url,
+            zone=settings.zone,
+            start=start,
+            end=end,
+        )
         logger.info("bronze_written_to_s3", mix_key=mix_key, flows_key=flows_key)
 
         # Step 6: Mark ready

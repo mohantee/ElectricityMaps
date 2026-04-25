@@ -13,98 +13,87 @@ import polars as pl
 from deltalake import DeltaTable, write_deltalake
 
 from electricity_maps.config import Settings, get_settings
+from electricity_maps.schemas.gold_schemas import (
+    GOLD_EXPORTS_SCHEMA,
+    GOLD_IMPORTS_SCHEMA,
+    GOLD_MIX_SCHEMA,
+    GoldExportsSchema,
+    GoldImportsSchema,
+    GoldMixSchema,
+)
+from electricity_maps.utils.helpers import filter_by_process_ts, get_zone_name, read_delta_table
 from electricity_maps.utils.logging import get_logger
 from electricity_maps.utils.state import PipelineState
 
 logger = get_logger(__name__)
 
 
-# ------------------------------------------------------------------ #
-#  Metadata mapping                                                   #
-# ------------------------------------------------------------------ #
+# ================================================================
+#  Mix Aggregation
+# ================================================================
 
-# A real pipeline might load this from a reference table
-_ZONE_NAMES = {
-    "FR": "France",
-    "DE": "Germany",
-    "ES": "Spain",
-    "IT-NO": "Italy North",
-    "CH": "Switzerland",
-    "BE": "Belgium",
-    "GB": "Great Britain",
-}
-
-
-def _get_zone_name(zone: str) -> str:
-    return _ZONE_NAMES.get(zone, zone)
-
-
-# ------------------------------------------------------------------ #
-#  Mix Aggregation                                                    #
-# ------------------------------------------------------------------ #
-
-def _aggregate_mix(silver_mix: pl.DataFrame) -> pl.DataFrame:
+def _aggregate_mix(silver_mix: pl.DataFrame, process_ts: int) -> pl.DataFrame:
     """Aggregate hourly MW to daily MWh and percentages."""
     if silver_mix.is_empty():
-        return silver_mix
-        
+        return pl.DataFrame(schema=GOLD_MIX_SCHEMA)
+
     # Since granularity is hourly, 1 MW for 1 hour = 1 MWh.
     # Group by zone and date (extract date from datetime)
     df = silver_mix.with_columns(
-        pl.col("datetime").dt.date().alias("reference_timestamp")
+        pl.col("datetime").dt.date().alias("date")
     )
-    
+
     # Sum the production columns
     prod_cols = [
         "nuclear_mw", "geothermal_mw", "biomass_mw", "coal_mw",
         "wind_mw", "solar_mw", "hydro_mw", "gas_mw", "oil_mw", "unknown_mw"
     ]
-    
+
     # Perform aggregation
     agg_exprs = [
-        pl.col(c).sum().alias(c.replace("_mw", "_mwh")) for c in prod_cols
+        pl.col(c).fill_null(0.0).sum().alias(c.replace("_mw", "_mwh")) for c in prod_cols
     ]
-    agg_exprs.append(pl.count("datetime").alias("hours_covered"))
-    
-    daily = df.group_by(["zone", "reference_timestamp", "year", "month"]).agg(agg_exprs)
-    
+    agg_exprs.append(pl.col("datetime").n_unique().cast(pl.Int32).alias("hours_covered"))
+
+    daily = df.group_by(["zone", "date", "year", "month"]).agg(agg_exprs)
+
     # Calculate total production
     mwh_cols = [c.replace("_mw", "_mwh") for c in prod_cols]
-    
+
     # Sum all sources, treating nulls as 0
     daily = daily.with_columns(
         pl.sum_horizontal([pl.col(c).fill_null(0.0) for c in mwh_cols]).alias("total_production_mwh")
     )
-    
+
     # Calculate percentages
     for c in mwh_cols:
         pct_col = c.replace("_mwh", "_pct")
         daily = daily.with_columns(
-            (pl.col(c) / pl.col("total_production_mwh") * 100).fill_nan(0.0).alias(pct_col)
+            pl.when(pl.col("total_production_mwh") > 0)
+            .then(pl.col(c) / pl.col("total_production_mwh") * 100)
+            .otherwise(0.0)
+            .fill_nan(0.0)
+            .alias(pct_col)
         )
-        
+
     # Simple proxies for fossil-free and renewable (a full implementation would be more robust)
     fossil_free_cols = ["nuclear_pct", "geothermal_pct", "biomass_pct", "wind_pct", "solar_pct", "hydro_pct"]
     renewable_cols = ["geothermal_pct", "biomass_pct", "wind_pct", "solar_pct", "hydro_pct"]
-    
+
     daily = daily.with_columns(
+        pl.lit(process_ts).cast(pl.Int64).alias("process_ts"),
+        pl.col("zone").map_elements(get_zone_name, return_dtype=pl.Utf8).alias("zone_name"),
         pl.sum_horizontal([pl.col(c).fill_null(0.0) for c in fossil_free_cols]).alias("fossil_free_avg_pct"),
         pl.sum_horizontal([pl.col(c).fill_null(0.0) for c in renewable_cols]).alias("renewable_avg_pct"),
     )
-    
-    # Add zone metadata
-    daily = daily.with_columns(
-        pl.col("zone").map_elements(_get_zone_name, return_dtype=pl.Utf8).alias("zone_metadata")
-    )
-    
-    # Keep only the required columns (drop the raw MWh sums to match schema)
+
     select_cols = [
-        "zone", "zone_metadata", "reference_timestamp", "nuclear_pct", "biomass_pct", "wind_pct",
+        "process_ts", "zone", "zone_name", "date", "nuclear_pct", "biomass_pct", "wind_pct",
         "solar_pct", "hydro_pct", "gas_pct", "oil_pct", "coal_pct", "geothermal_pct",
         "unknown_pct", "total_production_mwh", "fossil_free_avg_pct", "renewable_avg_pct",
         "hours_covered", "year", "month"
     ]
-    
+
     return daily.select(select_cols)
 
 
@@ -112,91 +101,123 @@ def _aggregate_mix(silver_mix: pl.DataFrame) -> pl.DataFrame:
 #  Flows Aggregation                                                  #
 # ------------------------------------------------------------------ #
 
-def _aggregate_flows(silver_flows: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """Aggregate hourly MW to daily MWh and split into imports and exports."""
+def _aggregate_flows(silver_flows: pl.DataFrame, process_ts: int) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Aggregate hourly MW to daily Net MWh and split into imports and exports."""
     if silver_flows.is_empty():
-        return pl.DataFrame(), pl.DataFrame()
-        
+        return pl.DataFrame(schema=GOLD_IMPORTS_SCHEMA), pl.DataFrame(schema=GOLD_EXPORTS_SCHEMA)
+
     df = silver_flows.with_columns(
         pl.col("datetime").dt.date().alias("date")
     )
-    
-    # Imports
-    imports_df = df.filter(pl.col("direction") == "import")
-    if not imports_df.is_empty():
-        imports_agg = imports_df.group_by(["zone", "neighbor_zone", "date", "year", "month"]).agg([
-            pl.col("power_mw").sum().alias("import_mwh"),
-            pl.count("datetime").alias("hours_covered")
-        ]).rename({"neighbor_zone": "source_zone"})
-        
-        imports_agg = imports_agg.with_columns(
-            pl.col("zone").map_elements(_get_zone_name, return_dtype=pl.Utf8).alias("zone_metadata")
-        )
-        # Select target columns
-        imports_agg = imports_agg.select([
-            "zone", "zone_name", "source_zone", "date", "import_mwh", "hours_covered", "year", "month"
-        ])
-    else:
-        imports_agg = pl.DataFrame()
-        
-    # Exports
-    exports_df = df.filter(pl.col("direction") == "export")
-    if not exports_df.is_empty():
-        exports_agg = exports_df.group_by(["zone", "neighbor_zone", "date", "year", "month"]).agg([
-            pl.col("power_mw").sum().alias("export_mwh"),
-            pl.count("datetime").alias("hours_covered")
-        ]).rename({"neighbor_zone": "destination_zone"})
-        
-        exports_agg = exports_agg.with_columns(
-            pl.col("zone").map_elements(_get_zone_name, return_dtype=pl.Utf8).alias("zone_metadata")
-        )
-        # Select target columns
-        exports_agg = exports_agg.select([
-            "zone", "zone_name", "destination_zone", "date", "export_mwh", "hours_covered", "year", "month"
-        ])
-    else:
-        exports_agg = pl.DataFrame()
-        
+
+    # Group by neighbor to calculate gross imports and exports
+    agg_df = df.group_by(["zone", "neighbor_zone", "date", "year", "month"]).agg([
+        pl.col("power_mw").filter(pl.col("direction") == "import").sum().alias("gross_import_mwh"),
+        pl.col("power_mw").filter(pl.col("direction") == "export").sum().alias("gross_export_mwh"),
+        pl.col("datetime").n_unique().cast(pl.Int32).alias("hours_covered"),
+    ])
+
+    agg_df = agg_df.with_columns([
+        pl.col("gross_import_mwh").fill_null(0.0),
+        pl.col("gross_export_mwh").fill_null(0.0),
+        pl.lit(process_ts).cast(pl.Int64).alias("process_ts"),
+        pl.col("zone").map_elements(get_zone_name, return_dtype=pl.Utf8).alias("zone_name"),
+        pl.col("neighbor_zone").map_elements(get_zone_name, return_dtype=pl.Utf8).alias("neighbor_zone_name"),
+    ])
+
+    # Calculate net flows: Net Import = Gross Import - Gross Export
+    agg_df = agg_df.with_columns(
+        (pl.col("gross_import_mwh") - pl.col("gross_export_mwh")).alias("net_flow")
+    )
+
+    # Imports: net_flow > 0
+    imports_agg = agg_df.filter(pl.col("net_flow") > 0).with_columns([
+        pl.col("net_flow").alias("import_mwh")
+    ]).rename({"neighbor_zone": "source_zone", "neighbor_zone_name": "source_zone_name"}).select([
+        "process_ts", "zone", "zone_name", "source_zone", "source_zone_name",
+        "date", "import_mwh", "hours_covered", "year", "month"
+    ])
+
+    # Exports: net_flow < 0 (store as positive net_mwh value)
+    exports_agg = agg_df.filter(pl.col("net_flow") < 0).with_columns([
+        (pl.col("net_flow") * -1.0).alias("export_mwh")
+    ]).rename({"neighbor_zone": "destination_zone", "neighbor_zone_name": "destination_zone_name"}).select([
+        "process_ts", "zone", "zone_name", "destination_zone", "destination_zone_name",
+        "date", "export_mwh", "hours_covered", "year", "month"
+    ])
+
     return imports_agg, exports_agg
 
 
-# ------------------------------------------------------------------ #
-#  Delta Lake write helpers                                           #
-# ------------------------------------------------------------------ #
+# ================================================================
+#  Incremental helpers
+# ================================================================
 
-def _merge_write_delta(
+def _affected_months(*frames: pl.DataFrame) -> list[tuple[int, int]]:
+    """Identify all (year, month) tuples present in a set of DataFrames."""
+    months: set[tuple[int, int]] = set()
+    for df in frames:
+        if df.is_empty() or not {"year", "month"}.issubset(set(df.columns)):
+            continue
+        for row in df.select(["year", "month"]).unique().iter_rows(named=True):
+            months.add((int(row["year"]), int(row["month"])))
+    return sorted(months)
+
+
+def _filter_to_months(df: pl.DataFrame, months: list[tuple[int, int]]) -> pl.DataFrame:
+    """Filter DataFrame to only rows with specified (year, month) combinations."""
+    if df.is_empty() or not months:
+        return df.head(0)
+
+    predicate = None
+    for year, month in months:
+        month_expr = (pl.col("year") == year) & (pl.col("month") == month)
+        predicate = month_expr if predicate is None else predicate | month_expr
+    return df.filter(predicate)
+
+
+def _predicate_for_months(months: list[tuple[int, int]]) -> str | None:
+    """Build a SQL WHERE predicate for Delta Lake based on (year, month) tuples."""
+    if not months:
+        return None
+    return " OR ".join(f"(year = {year} AND month = {month})" for year, month in months)
+
+
+def _delta_exists(table_uri: str, storage_options: dict[str, str]) -> bool:
+    """Check if a Delta table exists."""
+    try:
+        DeltaTable(table_uri, storage_options=storage_options)
+        return True
+    except Exception:
+        return False
+
+
+def _overwrite_delta(
     df: pl.DataFrame,
     table_uri: str,
     storage_options: dict[str, str],
-    partition_by: list[str] | None = None,
+    partition_by: list[str],
+    predicate: str | None,
 ) -> None:
-    """Write/append to a Delta table, creating it if needed."""
+    """Write or overwrite a Delta table, optionally filtering by predicate."""
     if df.is_empty():
         return
 
-    pa_table = df.to_arrow()
-    try:
-        write_deltalake(
-            table_uri,
-            pa_table,
-            mode="append",
-            partition_by=partition_by,
-            storage_options=storage_options,
-        )
-    except Exception:
-        # Table doesn't exist — create it
-        write_deltalake(
-            table_uri,
-            pa_table,
-            mode="overwrite",
-            partition_by=partition_by,
-            storage_options=storage_options,
-        )
+    write_kwargs = {
+        "mode": "overwrite",
+        "schema_mode": "overwrite",
+        "partition_by": partition_by,
+        "storage_options": storage_options,
+    }
+    if predicate is not None and _delta_exists(table_uri, storage_options):
+        write_kwargs["predicate"] = predicate
+
+    write_deltalake(table_uri, df.to_arrow(), **write_kwargs)
 
 
-# ------------------------------------------------------------------ #
-#  Main entry point                                                   #
-# ------------------------------------------------------------------ #
+# ================================================================
+#  Main entry point
+# ================================================================
 
 def transform_gold(
     settings: Settings | None = None,
@@ -228,28 +249,22 @@ def transform_gold(
     state.init_layer("gold", process_ts)
 
     try:
-        # We need to process all pending batches. For Gold layer (aggregation), 
-        # reading the entire silver tables and doing a full overwrite or merge might be
-        # needed in a real data warehouse. For this exercise, we will just read 
-        # the relevant partitions or the whole table, aggregate it, and overwrite 
-        # the gold table. In a real-world scenario, you'd want incremental aggregation.
-        
-        # Here we just read the whole silver tables to simplify the aggregation over dates
-        try:
-            mix_dt = DeltaTable(f"{settings.silver_dir}/electricity_mix", storage_options=so)
-            silver_mix = pl.from_arrow(mix_dt.to_pyarrow_table())
-        except Exception:
-            silver_mix = pl.DataFrame()
-            
-        try:
-            flows_dt = DeltaTable(f"{settings.silver_dir}/electricity_flows", storage_options=so)
-            silver_flows = pl.from_arrow(flows_dt.to_pyarrow_table())
-        except Exception:
-            silver_flows = pl.DataFrame()
+        # Step 2: Read Silver Delta tables and identify claimed process_ts months
+        silver_mix_all = read_delta_table(f"{settings.silver_dir}/electricity_mix", so)
+        silver_flows_all = read_delta_table(f"{settings.silver_dir}/electricity_flows", so)
 
-        # Step 3: Aggregate
-        gold_mix = _aggregate_mix(silver_mix)
-        gold_imports, gold_exports = _aggregate_flows(silver_flows)
+        pending_mix = filter_by_process_ts(silver_mix_all, pending_ts)
+        pending_flows = filter_by_process_ts(silver_flows_all, pending_ts)
+        affected_months = _affected_months(pending_mix, pending_flows)
+
+        silver_mix = _filter_to_months(silver_mix_all, affected_months)
+        silver_flows = _filter_to_months(silver_flows_all, affected_months)
+
+        # Step 3: Aggregate and validate
+        gold_mix = GoldMixSchema.validate(_aggregate_mix(silver_mix, process_ts))
+        gold_imports, gold_exports = _aggregate_flows(silver_flows, process_ts)
+        gold_imports = GoldImportsSchema.validate(gold_imports)
+        gold_exports = GoldExportsSchema.validate(gold_exports)
 
         logger.info(
             "gold_aggregated",
@@ -259,36 +274,30 @@ def transform_gold(
         )
 
         # Step 4: Write Delta Lake tables
-        # For simplicity, we overwrite the gold tables since we did a full aggregation.
-        # In a real system, you'd use write_deltalake with merge strategy.
         partition_cols = ["year", "month"]
+        predicate = _predicate_for_months(affected_months)
 
-        if not gold_mix.is_empty():
-            write_deltalake(
-                f"{settings.gold_dir}/daily_electricity_mix",
-                gold_mix.to_arrow(),
-                mode="overwrite",
-                partition_by=partition_cols,
-                storage_options=so,
-            )
-            
-        if not gold_imports.is_empty():
-            write_deltalake(
-                f"{settings.gold_dir}/daily_imports",
-                gold_imports.to_arrow(),
-                mode="overwrite",
-                partition_by=partition_cols,
-                storage_options=so,
-            )
-            
-        if not gold_exports.is_empty():
-            write_deltalake(
-                f"{settings.gold_dir}/daily_exports",
-                gold_exports.to_arrow(),
-                mode="overwrite",
-                partition_by=partition_cols,
-                storage_options=so,
-            )
+        _overwrite_delta(
+            gold_mix,
+            f"{settings.gold_dir}/daily_electricity_mix",
+            so,
+            partition_by=partition_cols,
+            predicate=predicate,
+        )
+        _overwrite_delta(
+            gold_imports,
+            f"{settings.gold_dir}/daily_imports",
+            so,
+            partition_by=partition_cols,
+            predicate=predicate,
+        )
+        _overwrite_delta(
+            gold_exports,
+            f"{settings.gold_dir}/daily_exports",
+            so,
+            partition_by=partition_cols,
+            predicate=predicate,
+        )
 
         # Step 5: Update state
         total = len(gold_mix) + len(gold_imports) + len(gold_exports)

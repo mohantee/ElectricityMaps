@@ -15,53 +15,94 @@ from datetime import datetime, timezone
 
 import polars as pl
 import s3fs
-from deltalake import DeltaTable, write_deltalake
+from deltalake import write_deltalake
 
 from electricity_maps.config import Settings, get_settings
+from electricity_maps.schemas.silver_schemas import (
+    BAD_DATA_SCHEMA,
+    FLOWS_SCHEMA,
+    MIX_SCHEMA,
+    SilverFlowsSchema,
+    SilverMixSchema,
+)
+from electricity_maps.utils.helpers import find_bronze_files, get_s3fs, read_bronze_parquet
 from electricity_maps.utils.logging import get_logger
 from electricity_maps.utils.state import PipelineState
 
 logger = get_logger(__name__)
 
 
-# ------------------------------------------------------------------ #
-#  S3 helpers                                                         #
-# ------------------------------------------------------------------ #
+# ================================================================
+#  Data processing helpers
+# ================================================================
 
-def _get_s3fs(settings: Settings) -> s3fs.S3FileSystem:
-    """Build an authenticated S3FileSystem."""
-    return s3fs.S3FileSystem(
-        key=settings.aws_access_key_id,
-        secret=settings.aws_secret_access_key,
-        client_kwargs={"region_name": settings.aws_region},
-    )
+def _empty_bad_data() -> pl.DataFrame:
+    return pl.DataFrame(schema=BAD_DATA_SCHEMA)
 
 
-def _read_bronze_parquet(s3_key: str, fs: s3fs.S3FileSystem) -> str:
-    """Read a Bronze Parquet file and return the raw_json string."""
-    with fs.open(s3_key, "rb") as f:
-        df = pl.read_parquet(f)
-    return df["raw_json"][0]
+def _concat_or_empty(frames: list[pl.DataFrame], schema: dict[str, pl.DataType]) -> pl.DataFrame:
+    non_empty = [df for df in frames if not df.is_empty()]
+    return pl.concat(non_empty) if non_empty else pl.DataFrame(schema=schema)
 
 
-def _find_bronze_files(
-    bronze_dir: str,
-    stream: str,
+def _bad_row(
+    *,
     process_ts: int,
-    zone: str,
-    fs: s3fs.S3FileSystem,
-) -> list[str]:
-    """Glob for Bronze Parquet files matching a process_ts."""
-    pattern = f"{bronze_dir}/{stream}/**/{ zone}_{process_ts}.parquet"
-    # Remove s3:// prefix for s3fs glob
-    clean = pattern.replace("s3://", "")
-    files = fs.glob(clean)
-    return [f"s3://{f}" for f in files]
+    row: object,
+    error_message: str,
+    row_datetime: object = "unknown",
+) -> dict:
+    return {
+        "process_ts": process_ts,
+        "datetime": str(row_datetime or "unknown"),
+        "raw_json": row if isinstance(row, str) else json.dumps(row, default=str),
+        "error_message": error_message,
+        "created_at": datetime.now(timezone.utc),
+    }
 
 
-# ------------------------------------------------------------------ #
-#  Mix flattening                                                     #
-# ------------------------------------------------------------------ #
+def _validate_rows(
+    df: pl.DataFrame,
+    schema_model: type,
+    process_ts: int,
+    empty_schema: dict[str, pl.DataType],
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Validate with Pandera and route row-level schema failures to bad data."""
+    if df.is_empty():
+        return pl.DataFrame(schema=empty_schema), _empty_bad_data()
+
+    try:
+        return schema_model.validate(df), _empty_bad_data()
+    except Exception:
+        valid_rows: list[pl.DataFrame] = []
+        bad_rows: list[dict] = []
+
+        for row in df.iter_rows(named=True):
+            row_df = pl.DataFrame([row], schema=df.schema, strict=False)
+            try:
+                valid_rows.append(schema_model.validate(row_df))
+            except Exception as row_error:
+                bad_rows.append(
+                    _bad_row(
+                        process_ts=int(row.get("process_ts") or process_ts),
+                        row=row,
+                        row_datetime=row.get("datetime", "unknown"),
+                        error_message=str(row_error),
+                    )
+                )
+
+        good_df = _concat_or_empty(valid_rows, empty_schema)
+        bad_df = (
+            pl.DataFrame(bad_rows, schema=BAD_DATA_SCHEMA, strict=False)
+            if bad_rows
+            else _empty_bad_data()
+        )
+        return good_df, bad_df
+
+
+# ================================================================
+#  Mix flattening
+# ================================================================
 
 def _flatten_mix(raw_json: str, zone: str, process_ts: int) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Flatten electricity mix JSON into a tabular DataFrame.
@@ -69,8 +110,18 @@ def _flatten_mix(raw_json: str, zone: str, process_ts: int) -> tuple[pl.DataFram
     Returns:
         (good_df, bad_df) — good records and any that failed to parse.
     """
-    data = json.loads(raw_json)
-    records = data.get("data", [])
+    try:
+        data = json.loads(raw_json)
+        records = data.get("data", [])
+    except Exception as e:
+        return (
+            pl.DataFrame(schema=MIX_SCHEMA),
+            pl.DataFrame(
+                [_bad_row(process_ts=process_ts, row=raw_json, error_message=str(e))],
+                schema=BAD_DATA_SCHEMA,
+                strict=False,
+            ),
+        )
 
     good_rows = []
     bad_rows = []
@@ -87,6 +138,7 @@ def _flatten_mix(raw_json: str, zone: str, process_ts: int) -> tuple[pl.DataFram
             dt = datetime.fromisoformat(rec["datetime"])
 
             row = {
+                "process_ts": process_ts,
                 "zone": zone,
                 "datetime": dt,
                 "updated_at": datetime.fromisoformat(rec["updatedAt"]),
@@ -115,39 +167,18 @@ def _flatten_mix(raw_json: str, zone: str, process_ts: int) -> tuple[pl.DataFram
             good_rows.append(row)
 
         except Exception as e:
-            bad_rows.append({
-                "process_ts": process_ts,
-                "datetime": rec.get("datetime", "unknown"),
-                "raw_json": json.dumps(rec),
-                "error_message": str(e),
-                "created_at": datetime.now(timezone.utc),
-            })
+            bad_rows.append(
+                _bad_row(
+                    process_ts=process_ts,
+                    row=rec,
+                    row_datetime=rec.get("datetime", "unknown") if isinstance(rec, dict) else "unknown",
+                    error_message=str(e),
+                )
+            )
 
     # Build DataFrames
-    mix_schema = {
-        "zone": pl.Utf8, "datetime": pl.Datetime("us", "UTC"),
-        "updated_at": pl.Datetime("us", "UTC"),
-        "is_estimated": pl.Boolean, "estimation_method": pl.Utf8,
-        "nuclear_mw": pl.Float64, "geothermal_mw": pl.Float64,
-        "biomass_mw": pl.Float64, "coal_mw": pl.Float64,
-        "wind_mw": pl.Float64, "solar_mw": pl.Float64,
-        "hydro_mw": pl.Float64, "gas_mw": pl.Float64,
-        "oil_mw": pl.Float64, "unknown_mw": pl.Float64,
-        "hydro_storage_charge_mw": pl.Float64,
-        "hydro_storage_discharge_mw": pl.Float64,
-        "battery_storage_charge_mw": pl.Float64,
-        "battery_storage_discharge_mw": pl.Float64,
-        "flow_exports_mw": pl.Float64, "flow_imports_mw": pl.Float64,
-        "year": pl.Int32, "month": pl.Int32, "day": pl.Int32,
-    }
-    good_df = pl.DataFrame(good_rows, schema=mix_schema, strict=False) if good_rows else pl.DataFrame(schema=mix_schema)
-
-    bad_schema = {
-        "process_ts": pl.Int64, "datetime": pl.Utf8,
-        "raw_json": pl.Utf8, "error_message": pl.Utf8,
-        "created_at": pl.Datetime("us", "UTC"),
-    }
-    bad_df = pl.DataFrame(bad_rows, schema=bad_schema, strict=False) if bad_rows else pl.DataFrame(schema=bad_schema)
+    good_df = pl.DataFrame(good_rows, schema=MIX_SCHEMA, strict=False) if good_rows else pl.DataFrame(schema=MIX_SCHEMA)
+    bad_df = pl.DataFrame(bad_rows, schema=BAD_DATA_SCHEMA, strict=False) if bad_rows else _empty_bad_data()
 
     return good_df, bad_df
 
@@ -162,8 +193,18 @@ def _flatten_flows(raw_json: str, zone: str, process_ts: int) -> tuple[pl.DataFr
     Returns:
         (good_df, bad_df)
     """
-    data = json.loads(raw_json)
-    records = data.get("data", [])
+    try:
+        data = json.loads(raw_json)
+        records = data.get("data", [])
+    except Exception as e:
+        return (
+            pl.DataFrame(schema=FLOWS_SCHEMA),
+            pl.DataFrame(
+                [_bad_row(process_ts=process_ts, row=raw_json, error_message=str(e))],
+                schema=BAD_DATA_SCHEMA,
+                strict=False,
+            ),
+        )
 
     good_rows = []
     bad_rows = []
@@ -176,6 +217,7 @@ def _flatten_flows(raw_json: str, zone: str, process_ts: int) -> tuple[pl.DataFr
             # Unpivot imports
             for neighbor, mw in (rec.get("import") or {}).items():
                 good_rows.append({
+                    "process_ts": process_ts,
                     "zone": zone,
                     "datetime": dt,
                     "updated_at": updated_at,
@@ -190,6 +232,7 @@ def _flatten_flows(raw_json: str, zone: str, process_ts: int) -> tuple[pl.DataFr
             # Unpivot exports
             for neighbor, mw in (rec.get("export") or {}).items():
                 good_rows.append({
+                    "process_ts": process_ts,
                     "zone": zone,
                     "datetime": dt,
                     "updated_at": updated_at,
@@ -202,29 +245,17 @@ def _flatten_flows(raw_json: str, zone: str, process_ts: int) -> tuple[pl.DataFr
                 })
 
         except Exception as e:
-            bad_rows.append({
-                "process_ts": process_ts,
-                "datetime": rec.get("datetime", "unknown"),
-                "raw_json": json.dumps(rec),
-                "error_message": str(e),
-                "created_at": datetime.now(timezone.utc),
-            })
+            bad_rows.append(
+                _bad_row(
+                    process_ts=process_ts,
+                    row=rec,
+                    row_datetime=rec.get("datetime", "unknown") if isinstance(rec, dict) else "unknown",
+                    error_message=str(e),
+                )
+            )
 
-    flows_schema = {
-        "zone": pl.Utf8, "datetime": pl.Datetime("us", "UTC"),
-        "updated_at": pl.Datetime("us", "UTC"),
-        "neighbor_zone": pl.Utf8, "direction": pl.Utf8,
-        "power_mw": pl.Float64,
-        "year": pl.Int32, "month": pl.Int32, "day": pl.Int32,
-    }
-    good_df = pl.DataFrame(good_rows, schema=flows_schema, strict=False) if good_rows else pl.DataFrame(schema=flows_schema)
-
-    bad_schema = {
-        "process_ts": pl.Int64, "datetime": pl.Utf8,
-        "raw_json": pl.Utf8, "error_message": pl.Utf8,
-        "created_at": pl.Datetime("us", "UTC"),
-    }
-    bad_df = pl.DataFrame(bad_rows, schema=bad_schema, strict=False) if bad_rows else pl.DataFrame(schema=bad_schema)
+    good_df = pl.DataFrame(good_rows, schema=FLOWS_SCHEMA, strict=False) if good_rows else pl.DataFrame(schema=FLOWS_SCHEMA)
+    bad_df = pl.DataFrame(bad_rows, schema=BAD_DATA_SCHEMA, strict=False) if bad_rows else _empty_bad_data()
 
     return good_df, bad_df
 
@@ -313,7 +344,7 @@ def transform_silver(
     settings = settings or get_settings()
     state = PipelineState(settings)
     process_ts = process_ts or int(time.time() * 1000)
-    fs = _get_s3fs(settings)
+    fs = get_s3fs(settings)
 
     # Step 1: Pick up ready bronze batches
     pending_ts = state.pickup_ready("bronze")
@@ -333,34 +364,40 @@ def transform_silver(
         # Step 2–5: Process each bronze batch
         for bts in pending_ts:
             # Find and read mix files
-            mix_files = _find_bronze_files(
+            mix_files = find_bronze_files(
                 settings.bronze_dir, "electricity_mix", bts, settings.zone, fs,
             )
             for s3_key in mix_files:
-                raw_json = _read_bronze_parquet(s3_key, fs)
-                good, bad = _flatten_mix(raw_json, settings.zone, bts)
+                raw_json = read_bronze_parquet(s3_key, fs)
+                good, bad = _flatten_mix(raw_json, settings.zone, process_ts)
                 all_mix_good.append(good)
                 all_mix_bad.append(bad)
 
             # Find and read flows files
-            flows_files = _find_bronze_files(
+            flows_files = find_bronze_files(
                 settings.bronze_dir, "electricity_flows", bts, settings.zone, fs,
             )
             for s3_key in flows_files:
-                raw_json = _read_bronze_parquet(s3_key, fs)
-                good, bad = _flatten_flows(raw_json, settings.zone, bts)
+                raw_json = read_bronze_parquet(s3_key, fs)
+                good, bad = _flatten_flows(raw_json, settings.zone, process_ts)
                 all_flows_good.append(good)
                 all_flows_bad.append(bad)
 
         # Concatenate all batches
-        mix_df = pl.concat(all_mix_good) if all_mix_good else pl.DataFrame()
-        mix_bad = pl.concat(all_mix_bad) if all_mix_bad else pl.DataFrame()
-        flows_df = pl.concat(all_flows_good) if all_flows_good else pl.DataFrame()
-        flows_bad = pl.concat(all_flows_bad) if all_flows_bad else pl.DataFrame()
+        mix_df = _concat_or_empty(all_mix_good, MIX_SCHEMA)
+        mix_bad = _concat_or_empty(all_mix_bad, BAD_DATA_SCHEMA)
+        flows_df = _concat_or_empty(all_flows_good, FLOWS_SCHEMA)
+        flows_bad = _concat_or_empty(all_flows_bad, BAD_DATA_SCHEMA)
 
         # Step 6: Deduplicate
         mix_df = _dedup_mix(mix_df)
         flows_df = _dedup_flows(flows_df)
+
+        # Step 7: Enforce schema and route validation failures to bad data
+        mix_df, mix_schema_bad = _validate_rows(mix_df, SilverMixSchema, process_ts, MIX_SCHEMA)
+        flows_df, flows_schema_bad = _validate_rows(flows_df, SilverFlowsSchema, process_ts, FLOWS_SCHEMA)
+        mix_bad = _concat_or_empty([mix_bad, mix_schema_bad], BAD_DATA_SCHEMA)
+        flows_bad = _concat_or_empty([flows_bad, flows_schema_bad], BAD_DATA_SCHEMA)
 
         logger.info(
             "silver_transformed",
@@ -370,7 +407,7 @@ def transform_silver(
             flows_bad=len(flows_bad),
         )
 
-        # Step 7: Write Delta Lake tables
+        # Step 8: Write Delta Lake tables
         so = settings.storage_options
         partition_cols = ["year", "month", "day"]
 
@@ -401,7 +438,7 @@ def transform_silver(
                 so,
             )
 
-        # Step 8: Update state
+        # Step 9: Update state
         total = len(mix_df) + len(flows_df)
         state.mark_complete("bronze", pending_ts)
         state.mark_ready("silver", process_ts, total)
