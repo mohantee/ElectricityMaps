@@ -105,7 +105,7 @@ State machine per row: **`I` → `R` → `P` → `C`**
 | Column | Type | Description |
 |---|---|---|
 | `process` | `Utf8` | Layer name: `bronze`, `silver`, `gold` |
-| `process_ts` | `Int64` | Epoch timestamp — unique batch identifier, links layers |
+| `process_ts` | `Int64` | Epoch timestamp(with ms) — unique batch identifier, links layers |
 | `start_timestamp` | `Datetime(us, UTC)` | When this layer started processing |
 | `end_timestamp` | `Datetime(us, UTC)` (nullable) | When this layer finished (null while status=I) |
 | `status` | `Utf8` | `I` / `R` / `P` / `C` |
@@ -291,7 +291,7 @@ class Settings(BaseSettings):
     env: str = "prod"
     api_key: str
     api_base_url: str = "https://api.electricitymaps.com/v4"
-    data_dir: Path = Path("./data")
+    data_dir: Path = Path("s3://electricity-maps/data")
     zone: str = "FR"
 
     model_config = SettingsConfigDict(
@@ -347,9 +347,8 @@ __pycache__/
 | 0.2 | `.env.example` with `EMAPS_API_KEY`, `DATA_DIR` | `.env.example` |
 | 0.3 | `.gitignore` (data/, .env, __pycache__, .venv) | `.gitignore` |
 | 0.4 | Config module (Pydantic Settings) | `config.py` |
-| 0.5 | Structured logging | `utils/logging.py` |
-| 0.6 | Partition path helpers | `utils/partitioning.py` |
-| 0.7 | `el_state` manager class | `utils/state.py` |
+| 0.5 | Utils | `utils/utils.py` (reusuable functions to write/read/partition) |
+
 
 ### Phase 1: API Client
 | # | Task | Details |
@@ -364,11 +363,11 @@ __pycache__/
 | # | Task | Details |
 |---|---|---|
 | 2.1 | `ingest_bronze(zone, process_ts)` | Main entry point |
-| 2.2 | Write `el_state` entry (status=I) | Via `PipelineState.init_layer()` |
-| 2.3 | Calculate time range | `start` = last bronze `end_timestamp` from `el_state` (floor to hour), `end` = current hour start |
+| 2.2 | Write `el_state` entry (status=I) with process_ts | Via utils.py |
+| 2.3 | Calculate time range | `start` = last bronze `process_ts` from `el_state` (floor to hour), `end` = current hour start |
 | 2.4 | Call both API endpoints | `get_mix_range(zone, start, end)` + `get_flows_range(zone, start, end)` |
 | 2.5 | Add metadata envelope | `_ingestion_timestamp`, `_source_url`, `_zone`, `_start`, `_end` |
-| 2.6 | Store as raw JSON files | `bronze/{stream}/year=YYYY/month=MM/day=DD/{zone}_{ts}.json` |
+| 2.6 | Store as parquet files | `bronze/{stream}/year=YYYY/month=MM/day=DD/{zone}_{process_ts}.parquet` |
 | 2.7 | Update `el_state` to R | With record_count |
 | 2.8 | Error handling | On failure → row stays at `I` (Airflow retries) |
 
@@ -381,8 +380,8 @@ end   = 17:00 (current hour start)
 
 **Bronze output:**
 ```
-data/bronze/electricity_mix/year=2026/month=04/day=24/FR_2026-04-24T17-00-00Z.json
-data/bronze/electricity_flows/year=2026/month=04/day=24/FR_2026-04-24T17-00-00Z.json
+data/bronze/electricity_mix/year=2026/month=04/day=24/FR_1745489400.parquet
+data/bronze/electricity_flows/year=2026/month=04/day=24/FR_1745489400.parquet
 ```
 
 ### Phase 3: Silver Layer
@@ -449,7 +448,7 @@ Records that **fail to parse** (malformed JSON, unexpected schema) are written t
 | 3.6 | Cast types (datetime, Float64, Boolean) |
 | 3.7 | Deduplicate on unique keys |
 | 3.8 | Pandera schema validation |
-| 3.9 | Write Delta Lake tables, partitioned by `year/month/day` |
+| 3.9 | Write Delta Lake tables, partitioned by `year/month/day`  and parse failed to error tables|
 | 3.10 | Update bronze `el_state` → `C`, silver `el_state` → `R` |
 
 ### Phase 4: Gold Layer
@@ -609,16 +608,3 @@ def pick_pending_and_process(upstream_layer: str, **kwargs):
 ```
 Phase 0 → Phase 1 → Phase 2 → Phase 3 → Phase 4 → Phase 5 → Phase 6 → Phase 7 → Phase 8
 ```
-
-| Phase | Effort |
-|---|---|
-| 0: Scaffolding + state | 25 min |
-| 1: API Client | 25 min |
-| 2: Bronze | 25 min |
-| 3: Silver | 40 min |
-| 4: Gold | 35 min |
-| 5: Airflow DAG | 20 min |
-| 6: Docker + Notebooks | 30 min |
-| 7: Architecture Doc | 30 min |
-| 8: README & Polish | 15 min |
-| **Total** | **~4 hours** |
