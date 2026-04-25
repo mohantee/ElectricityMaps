@@ -26,10 +26,11 @@ from electricity_maps.schemas.silver_schemas import (
     SilverMixSchema,
 )
 from electricity_maps.utils.helpers import find_bronze_files, get_s3fs, read_bronze_parquet
-from electricity_maps.utils.logging import get_logger
 from electricity_maps.utils.state import PipelineState
 
-logger = get_logger(__name__)
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 # ================================================================

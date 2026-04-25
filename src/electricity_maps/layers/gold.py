@@ -22,10 +22,11 @@ from electricity_maps.schemas.gold_schemas import (
     GoldMixSchema,
 )
 from electricity_maps.utils.helpers import filter_by_process_ts, get_zone_name, read_delta_table
-from electricity_maps.utils.logging import get_logger
 from electricity_maps.utils.state import PipelineState
 
-logger = get_logger(__name__)
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 # ================================================================
@@ -83,6 +84,7 @@ def _aggregate_mix(silver_mix: pl.DataFrame, process_ts: int) -> pl.DataFrame:
     daily = daily.with_columns(
         pl.lit(process_ts).cast(pl.Int64).alias("process_ts"),
         pl.col("zone").map_elements(get_zone_name, return_dtype=pl.Utf8).alias("zone_name"),
+        pl.col("date").dt.day().alias("day"),
         pl.sum_horizontal([pl.col(c).fill_null(0.0) for c in fossil_free_cols]).alias("fossil_free_avg_pct"),
         pl.sum_horizontal([pl.col(c).fill_null(0.0) for c in renewable_cols]).alias("renewable_avg_pct"),
     )
@@ -91,7 +93,7 @@ def _aggregate_mix(silver_mix: pl.DataFrame, process_ts: int) -> pl.DataFrame:
         "process_ts", "zone", "zone_name", "date", "nuclear_pct", "biomass_pct", "wind_pct",
         "solar_pct", "hydro_pct", "gas_pct", "oil_pct", "coal_pct", "geothermal_pct",
         "unknown_pct", "total_production_mwh", "fossil_free_avg_pct", "renewable_avg_pct",
-        "hours_covered", "year", "month"
+        "hours_covered", "year", "month", "day"
     ]
 
     return daily.select(select_cols)
@@ -123,6 +125,7 @@ def _aggregate_flows(silver_flows: pl.DataFrame, process_ts: int) -> tuple[pl.Da
         pl.lit(process_ts).cast(pl.Int64).alias("process_ts"),
         pl.col("zone").map_elements(get_zone_name, return_dtype=pl.Utf8).alias("zone_name"),
         pl.col("neighbor_zone").map_elements(get_zone_name, return_dtype=pl.Utf8).alias("neighbor_zone_name"),
+        pl.col("date").dt.day().alias("day"),
     ])
 
     # Calculate net flows: Net Import = Gross Import - Gross Export
@@ -135,7 +138,7 @@ def _aggregate_flows(silver_flows: pl.DataFrame, process_ts: int) -> tuple[pl.Da
         pl.col("net_flow").alias("import_mwh")
     ]).rename({"neighbor_zone": "source_zone", "neighbor_zone_name": "source_zone_name"}).select([
         "process_ts", "zone", "zone_name", "source_zone", "source_zone_name",
-        "date", "import_mwh", "hours_covered", "year", "month"
+        "date", "import_mwh", "hours_covered", "year", "month", "day"
     ])
 
     # Exports: net_flow < 0 (store as positive net_mwh value)
@@ -143,7 +146,7 @@ def _aggregate_flows(silver_flows: pl.DataFrame, process_ts: int) -> tuple[pl.Da
         (pl.col("net_flow") * -1.0).alias("export_mwh")
     ]).rename({"neighbor_zone": "destination_zone", "neighbor_zone_name": "destination_zone_name"}).select([
         "process_ts", "zone", "zone_name", "destination_zone", "destination_zone_name",
-        "date", "export_mwh", "hours_covered", "year", "month"
+        "date", "export_mwh", "hours_covered", "year", "month", "day"
     ])
 
     return imports_agg, exports_agg
@@ -153,34 +156,34 @@ def _aggregate_flows(silver_flows: pl.DataFrame, process_ts: int) -> tuple[pl.Da
 #  Incremental helpers
 # ================================================================
 
-def _affected_months(*frames: pl.DataFrame) -> list[tuple[int, int]]:
-    """Identify all (year, month) tuples present in a set of DataFrames."""
-    months: set[tuple[int, int]] = set()
+def _affected_days(*frames: pl.DataFrame) -> list[tuple[int, int, int]]:
+    """Identify all (year, month, day) tuples present in a set of DataFrames."""
+    days: set[tuple[int, int, int]] = set()
     for df in frames:
-        if df.is_empty() or not {"year", "month"}.issubset(set(df.columns)):
+        if df.is_empty() or not {"year", "month", "day"}.issubset(set(df.columns)):
             continue
-        for row in df.select(["year", "month"]).unique().iter_rows(named=True):
-            months.add((int(row["year"]), int(row["month"])))
-    return sorted(months)
+        for row in df.select(["year", "month", "day"]).unique().iter_rows(named=True):
+            days.add((int(row["year"]), int(row["month"]), int(row["day"])))
+    return sorted(days)
 
 
-def _filter_to_months(df: pl.DataFrame, months: list[tuple[int, int]]) -> pl.DataFrame:
-    """Filter DataFrame to only rows with specified (year, month) combinations."""
-    if df.is_empty() or not months:
+def _filter_to_days(df: pl.DataFrame, days: list[tuple[int, int, int]]) -> pl.DataFrame:
+    """Filter DataFrame to only rows with specified (year, month, day) combinations."""
+    if df.is_empty() or not days:
         return df.head(0)
 
     predicate = None
-    for year, month in months:
-        month_expr = (pl.col("year") == year) & (pl.col("month") == month)
-        predicate = month_expr if predicate is None else predicate | month_expr
+    for year, month, day in days:
+        day_expr = (pl.col("year") == year) & (pl.col("month") == month) & (pl.col("day") == day)
+        predicate = day_expr if predicate is None else predicate | day_expr
     return df.filter(predicate)
 
 
-def _predicate_for_months(months: list[tuple[int, int]]) -> str | None:
-    """Build a SQL WHERE predicate for Delta Lake based on (year, month) tuples."""
-    if not months:
+def _predicate_for_days(days: list[tuple[int, int, int]]) -> str | None:
+    """Build a SQL WHERE predicate for Delta Lake based on (year, month, day) tuples."""
+    if not days:
         return None
-    return " OR ".join(f"(year = {year} AND month = {month})" for year, month in months)
+    return " OR ".join(f"(year = {year} AND month = {month} AND day = {day})" for year, month, day in days)
 
 
 def _delta_exists(table_uri: str, storage_options: dict[str, str]) -> bool:
@@ -192,27 +195,34 @@ def _delta_exists(table_uri: str, storage_options: dict[str, str]) -> bool:
         return False
 
 
-def _overwrite_delta(
+def _merge_write_delta(
     df: pl.DataFrame,
     table_uri: str,
     storage_options: dict[str, str],
-    partition_by: list[str],
-    predicate: str | None,
+    partition_by: list[str] | None = None,
 ) -> None:
-    """Write or overwrite a Delta table, optionally filtering by predicate."""
+    """Write/append to a Delta table, creating it if needed."""
     if df.is_empty():
         return
 
-    write_kwargs = {
-        "mode": "overwrite",
-        "schema_mode": "overwrite",
-        "partition_by": partition_by,
-        "storage_options": storage_options,
-    }
-    if predicate is not None and _delta_exists(table_uri, storage_options):
-        write_kwargs["predicate"] = predicate
-
-    write_deltalake(table_uri, df.to_arrow(), **write_kwargs)
+    pa_table = df.to_arrow()
+    try:
+        write_deltalake(
+            table_uri,
+            pa_table,
+            mode="append",
+            partition_by=partition_by,
+            storage_options=storage_options,
+        )
+    except Exception:
+        # Table doesn't exist — create it
+        write_deltalake(
+            table_uri,
+            pa_table,
+            mode="overwrite",
+            partition_by=partition_by,
+            storage_options=storage_options,
+        )
 
 
 # ================================================================
@@ -255,10 +265,10 @@ def transform_gold(
 
         pending_mix = filter_by_process_ts(silver_mix_all, pending_ts)
         pending_flows = filter_by_process_ts(silver_flows_all, pending_ts)
-        affected_months = _affected_months(pending_mix, pending_flows)
+        affected_days = _affected_days(pending_mix, pending_flows)
 
-        silver_mix = _filter_to_months(silver_mix_all, affected_months)
-        silver_flows = _filter_to_months(silver_flows_all, affected_months)
+        silver_mix = _filter_to_days(silver_mix_all, affected_days)
+        silver_flows = _filter_to_days(silver_flows_all, affected_days)
 
         # Step 3: Aggregate and validate
         gold_mix = GoldMixSchema.validate(_aggregate_mix(silver_mix, process_ts))
@@ -274,29 +284,26 @@ def transform_gold(
         )
 
         # Step 4: Write Delta Lake tables
-        partition_cols = ["year", "month"]
-        predicate = _predicate_for_months(affected_months)
+        partition_cols = ["year", "month", "day"]
+        predicate = _predicate_for_days(affected_days)
 
-        _overwrite_delta(
+        _merge_write_delta(
             gold_mix,
             f"{settings.gold_dir}/daily_electricity_mix",
             so,
             partition_by=partition_cols,
-            predicate=predicate,
         )
-        _overwrite_delta(
+        _merge_write_delta(
             gold_imports,
             f"{settings.gold_dir}/daily_imports",
             so,
             partition_by=partition_cols,
-            predicate=predicate,
         )
-        _overwrite_delta(
+        _merge_write_delta(
             gold_exports,
             f"{settings.gold_dir}/daily_exports",
             so,
             partition_by=partition_cols,
-            predicate=predicate,
         )
 
         # Step 5: Update state

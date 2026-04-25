@@ -21,11 +21,12 @@ import s3fs
 from electricity_maps.api.client import ElectricityMapsClient
 from electricity_maps.config import Settings, get_settings
 from electricity_maps.utils.helpers import floor_to_hour, get_s3fs
-from electricity_maps.utils.logging import get_logger
 from electricity_maps.utils.partitioning import build_bronze_key
 from electricity_maps.utils.state import PipelineState
 
-logger = get_logger(__name__)
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def _calculate_time_range(

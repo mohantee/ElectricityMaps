@@ -35,6 +35,7 @@ GOLD_MIX_SCHEMA = {
     "hours_covered": pl.Int32,
     "year": pl.Int32,
     "month": pl.Int32,
+    "day": pl.Int32,
 }
 
 
@@ -49,6 +50,7 @@ GOLD_IMPORTS_SCHEMA = {
     "hours_covered": pl.Int32,
     "year": pl.Int32,
     "month": pl.Int32,
+    "day": pl.Int32,
 }
 
 
@@ -63,6 +65,7 @@ GOLD_EXPORTS_SCHEMA = {
     "hours_covered": pl.Int32,
     "year": pl.Int32,
     "month": pl.Int32,
+    "day": pl.Int32,
 }
 
 
@@ -99,6 +102,7 @@ class GoldMixSchema(pa.DataFrameModel):
     # Partition keys
     year: pl.Int32
     month: pl.Int32
+    day: pl.Int32
 
     class Config:
         coerce = True
@@ -120,6 +124,7 @@ class GoldImportsSchema(pa.DataFrameModel):
     # Partition keys
     year: pl.Int32
     month: pl.Int32
+    day: pl.Int32
 
     class Config:
         coerce = True
@@ -141,6 +146,7 @@ class GoldExportsSchema(pa.DataFrameModel):
     # Partition keys
     year: pl.Int32
     month: pl.Int32
+    day: pl.Int32
 
     class Config:
         coerce = True

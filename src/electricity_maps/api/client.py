@@ -129,66 +129,6 @@ class ElectricityMapsClient:
 
     # -- parsed (typed) endpoints ------------------------------------------
 
-    def get_mix_range(
-        self,
-        zone: str,
-        start: datetime,
-        end: datetime,
-    ) -> ElectricityMixResponse:
-        """Fetch electricity mix for a zone over a time range.
-
-        Args:
-            zone: Zone code (e.g. ``"FR"``).
-            start: Range start (UTC).
-            end: Range end (UTC).
-
-        Returns:
-            Parsed ``ElectricityMixResponse``.
-        """
-        raw = self._request(
-            "/electricity-mix/past-range",
-            params={
-                "zone": zone,
-                "start": start.isoformat(),
-                "end": end.isoformat(),
-            },
-        )
-        logger.info(
-            "Fetched mix range for %s: %s → %s (%d records)",
-            zone, start, end, len(raw.get("data", [])),
-        )
-        return ElectricityMixResponse.model_validate(raw)
-
-    def get_flows_range(
-        self,
-        zone: str,
-        start: datetime,
-        end: datetime,
-    ) -> ElectricityFlowsResponse:
-        """Fetch electricity flows for a zone over a time range.
-
-        Args:
-            zone: Zone code (e.g. ``"FR"``).
-            start: Range start (UTC).
-            end: Range end (UTC).
-
-        Returns:
-            Parsed ``ElectricityFlowsResponse``.
-        """
-        raw = self._request(
-            "/electricity-flows/past-range",
-            params={
-                "zone": zone,
-                "start": start.isoformat(),
-                "end": end.isoformat(),
-            },
-        )
-        logger.info(
-            "Fetched flows range for %s: %s → %s (%d records)",
-            zone, start, end, len(raw.get("data", [])),
-        )
-        return ElectricityFlowsResponse.model_validate(raw)
-
     # -- raw (untyped) endpoints for Bronze --------------------------------
 
     def get_raw_mix_range(
