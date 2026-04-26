@@ -30,8 +30,8 @@ def test_ingest_bronze_full_cycle(test_settings, sample_mix_response, sample_flo
         # Check files
         from electricity_maps.utils.helpers import get_s3fs
         fs = get_s3fs(test_settings)
-        assert fs.exists(result["mix_key"])
-        assert fs.exists(result["flows_key"])
+        assert fs.exists(result["mix_table"])
+        assert fs.exists(result["flows_table"])
 
 def test_ingest_bronze_api_failure(test_settings):
     """Negative scenario: Bronze ingestion fails when API fails."""
