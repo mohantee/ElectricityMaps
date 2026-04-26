@@ -18,6 +18,8 @@ COPY --chown=airflow:root pyproject.toml /opt/airflow/
 COPY --chown=airflow:root src/ /opt/airflow/src/
 COPY --chown=airflow:root dags/ /opt/airflow/dags/
 COPY --chown=airflow:root config/ /opt/airflow/config/
+COPY --chown=airflow:root README.md /opt/airflow/
+
 
 # Install the project
 RUN pip install --no-cache-dir -e ".[airflow]"

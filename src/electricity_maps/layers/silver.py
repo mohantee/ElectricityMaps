@@ -26,7 +26,7 @@ from electricity_maps.schemas.silver_schemas import (
     SilverFlowsSchema,
     SilverMixSchema,
 )
-from electricity_maps.utils.helpers import find_bronze_files, get_s3fs, read_bronze_parquet
+from electricity_maps.utils.helpers import filter_by_process_ts, read_delta_table
 from electricity_maps.utils.state import PipelineState
 
 logger = logging.getLogger(__name__)
@@ -406,7 +406,6 @@ def transform_silver(
     settings = settings or get_settings()
     state = PipelineState(settings)
     process_ts = process_ts or int(time.time() * 1000)
-    fs = get_s3fs(settings)
 
     # Step 1: Pick up ready bronze batches
     pending_ts = state.pickup_ready("bronze")
@@ -423,27 +422,26 @@ def transform_silver(
         all_flows_good = []
         all_flows_bad = []
 
-        # Step 2-5: Process each bronze batch
-        for bts in pending_ts:
-            # Find and read mix files
-            mix_files = find_bronze_files(
-                settings.bronze_dir, "electricity_mix", bts, settings.zone, fs,
-            )
-            for s3_key in mix_files:
-                raw_json = read_bronze_parquet(s3_key, fs)
-                good, bad = _flatten_mix(raw_json, settings.zone, process_ts)
-                all_mix_good.append(good)
-                all_mix_bad.append(bad)
+        # Step 2-5: Read Bronze Delta rows for pending process_ts and flatten payloads.
+        so = settings.storage_options
+        bronze_mix = filter_by_process_ts(
+            read_delta_table(f"{settings.bronze_dir}/electricity_mix", so),
+            pending_ts,
+        )
+        bronze_flows = filter_by_process_ts(
+            read_delta_table(f"{settings.bronze_dir}/electricity_flows", so),
+            pending_ts,
+        )
 
-            # Find and read flows files
-            flows_files = find_bronze_files(
-                settings.bronze_dir, "electricity_flows", bts, settings.zone, fs,
-            )
-            for s3_key in flows_files:
-                raw_json = read_bronze_parquet(s3_key, fs)
-                good, bad = _flatten_flows(raw_json, settings.zone, process_ts)
-                all_flows_good.append(good)
-                all_flows_bad.append(bad)
+        for row in bronze_mix.select(["raw_json"]).iter_rows(named=True):
+            good, bad = _flatten_mix(str(row["raw_json"]), settings.zone, process_ts)
+            all_mix_good.append(good)
+            all_mix_bad.append(bad)
+
+        for row in bronze_flows.select(["raw_json"]).iter_rows(named=True):
+            good, bad = _flatten_flows(str(row["raw_json"]), settings.zone, process_ts)
+            all_flows_good.append(good)
+            all_flows_bad.append(bad)
 
         # Concatenate all batches
         mix_df = _concat_or_empty(all_mix_good, MIX_SCHEMA)
@@ -467,7 +465,6 @@ def transform_silver(
         )
 
         # Step 8: Write Delta Lake tables
-        so = settings.storage_options
         partition_cols = ["year", "month", "day"]
 
         _upsert_by_keys_overwrite(

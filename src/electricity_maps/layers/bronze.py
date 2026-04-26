@@ -11,19 +11,15 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import time
 from datetime import UTC, datetime, timedelta
-from io import BytesIO
 
-import pyarrow as pa
-import pyarrow.parquet as pq
-import s3fs
+import polars as pl
+from deltalake import write_deltalake
 
 from electricity_maps.api.client import ElectricityMapsClient
 from electricity_maps.config import Settings, get_settings
-from electricity_maps.utils.helpers import floor_to_hour, get_s3fs
-from electricity_maps.utils.partitioning import build_bronze_key
+from electricity_maps.utils.helpers import floor_to_hour
 from electricity_maps.utils.state import PipelineState
 
 logger = logging.getLogger(__name__)
@@ -35,13 +31,13 @@ def _calculate_time_range(
 ) -> tuple[datetime, datetime]:
     """Determine the ingestion time range for this run.
 
-    - ``start`` = last bronze ``end_timestamp`` (floored to hour),
+    - ``start`` = last bronze ``process_ts`` (floored to hour),
       or 24h ago if no prior run.
     - ``end`` = current hour start.
 
     This ensures automatic catch-up if the pipeline was down.
     """
-    last_end = state.get_last_end_timestamp("bronze")
+    last_end = state.get_last_process_ts("bronze")
 
     if last_end is not None:
         start = floor_to_hour(last_end)
@@ -54,14 +50,15 @@ def _calculate_time_range(
     # Ensure we have at least 1 hour to fetch
     if start >= end:
         start = end - timedelta(hours=1)
+        
 
     return start, end
 
 
-def _write_parquet_to_s3(
+def _write_bronze_delta(
     data: dict,
-    s3_key: str,
-    fs: s3fs.S3FileSystem,
+    table_uri: str,
+    storage_options: dict[str, str],
     *,
     process_ts: int,
     ingestion_ts: datetime,
@@ -70,28 +67,30 @@ def _write_parquet_to_s3(
     start: datetime,
     end: datetime,
 ) -> None:
-    """Serialize one raw API response plus metadata columns to S3."""
-    json_bytes = json.dumps(data, default=str).encode("utf-8")
-    table = pa.table({
-        "process_ts": [process_ts],
-        "ingestion_timestamp": [ingestion_ts],
-        "source_url": [source_url],
-        "zone": [zone],
-        "range_start": [start],
-        "range_end": [end],
-        "raw_json": [json_bytes.decode("utf-8")],
-        "record_count": [len(data.get("data", []))],
-    })
-
-    buf = BytesIO()
-    pq.write_table(table, buf)
-    buf.seek(0)
-
-    # Ensure parent directory exists (needed for local filesystem in tests)
-    fs.makedirs(os.path.dirname(s3_key), exist_ok=True)
-
-    with fs.open(s3_key, "wb") as f:
-        f.write(buf.read())
+    """Append one raw Bronze row to a Delta table."""
+    row_df = pl.DataFrame(
+        [{
+            "process_ts": process_ts,
+            "ingestion_timestamp": ingestion_ts,
+            "source_url": source_url,
+            "zone": zone,
+            "range_start": start,
+            "range_end": end,
+            "raw_json": json.dumps(data, default=str),
+            "record_count": len(data.get("data", [])),
+            "year": ingestion_ts.year,
+            "month": ingestion_ts.month,
+            "day": ingestion_ts.day,
+        }],
+        strict=False,
+    )
+    write_deltalake(
+        table_uri,
+        row_df.to_arrow(),
+        mode="append",
+        partition_by=["year", "month", "day"],
+        storage_options=storage_options,
+    )
 
 
 def ingest_bronze(
@@ -149,21 +148,14 @@ def ingest_bronze(
             f"?zone={settings.zone}&start={start.isoformat()}&end={end.isoformat()}"
         )
 
-        # Step 5: Write to S3
-        fs = get_s3fs(settings)
-        mix_key = build_bronze_key(
-            settings.bronze_dir, "electricity_mix",
-            settings.zone, process_ts, ingestion_ts,
-        )
-        flows_key = build_bronze_key(
-            settings.bronze_dir, "electricity_flows",
-            settings.zone, process_ts, ingestion_ts,
-        )
-
-        _write_parquet_to_s3(
+        # Step 5: Write to Bronze Delta tables
+        so = settings.storage_options
+        mix_table = f"{settings.bronze_dir}/electricity_mix"
+        flows_table = f"{settings.bronze_dir}/electricity_flows"
+        _write_bronze_delta(
             raw_mix,
-            mix_key,
-            fs,
+            mix_table,
+            so,
             process_ts=process_ts,
             ingestion_ts=ingestion_ts,
             source_url=mix_url,
@@ -171,10 +163,10 @@ def ingest_bronze(
             start=start,
             end=end,
         )
-        _write_parquet_to_s3(
+        _write_bronze_delta(
             raw_flows,
-            flows_key,
-            fs,
+            flows_table,
+            so,
             process_ts=process_ts,
             ingestion_ts=ingestion_ts,
             source_url=flows_url,
@@ -182,7 +174,7 @@ def ingest_bronze(
             start=start,
             end=end,
         )
-        logger.info(f"bronze_written_to_s3: mix_key={mix_key}, flows_key={flows_key}")
+        logger.info(f"bronze_written_to_delta: mix_table={mix_table}, flows_table={flows_table}")
 
         # Step 6: Mark ready
         total_records = mix_count + flows_count
@@ -195,8 +187,8 @@ def ingest_bronze(
             "end": end.isoformat(),
             "mix_records": mix_count,
             "flows_records": flows_count,
-            "mix_key": mix_key,
-            "flows_key": flows_key,
+            "mix_table": mix_table,
+            "flows_table": flows_table,
         }
 
     except Exception as e:

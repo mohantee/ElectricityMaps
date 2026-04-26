@@ -9,6 +9,8 @@ x-airflow-common:
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
     AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__WEBSERVER__SECRET_KEY: '46e430d441e222541a5477d94943f292'
+    AIRFLOW__CORE__FERNET_KEY: '6-tB7pQ-n_S_p_0P8fX1-k_J_l_o_V_o_o_o_o_o_o_o='
     EMAPS_ENV: prod
   volumes:
     - ./dags:/opt/airflow/dags

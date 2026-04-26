@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     emaps_api_base_url: str = "https://api.electricitymaps.com/v4"
     emaps_data_dir: str = "s3://electricity-maps/data"
     emaps_zone: str = "FR"
+    emaps_log_level: str = "INFO"
 
     # ---- AWS credentials ----
     aws_access_key_id: str = ""
@@ -96,5 +97,31 @@ class Settings(BaseSettings):
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    """Return a cached ``Settings`` instance."""
-    return Settings()
+    """Return a cached ``Settings`` instance and auto-configure logging."""
+    settings = Settings()
+    setup_logging(settings.emaps_log_level)
+    return settings
+
+
+def setup_logging(level: str | None = None) -> None:
+    """Configure basic logging for the pipeline.
+
+    In notebooks, this ensures that logger.info() messages are visible.
+    """
+    import logging
+    if level is None:
+        # Fallback to INFO if settings aren't loaded yet
+        level = os.getenv("EMAPS_LOG_LEVEL", "INFO")
+
+    numeric_level = getattr(logging, level.upper(), logging.INFO)
+
+    # Configure root logger
+    logging.basicConfig(
+        level=numeric_level,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        force=True,
+    )
+
+    # Also explicitly set level for the electricity_maps namespace
+    # to ensure it's not overridden by other library configs
+    logging.getLogger("electricity_maps").setLevel(numeric_level)

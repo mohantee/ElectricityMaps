@@ -1,6 +1,6 @@
 """Gold Layer — Business-Ready Data Products.
 
-Reads Silver Delta tables, performs daily aggregations (converting MW to MWh),
+Reads Silver Delta tables, performs aggregations (converting MW to MWh),
 calculates percentages, and splits flows into imports and exports.
 Results are written as partitioned Delta Lake tables.
 """
@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 # ================================================================
-#  Mix Aggregation
+#  Daily Relative Mix
 # ================================================================
 
 def _aggregate_mix(silver_mix: pl.DataFrame, process_ts: int) -> pl.DataFrame:
@@ -37,35 +37,32 @@ def _aggregate_mix(silver_mix: pl.DataFrame, process_ts: int) -> pl.DataFrame:
     if silver_mix.is_empty():
         return pl.DataFrame(schema=GOLD_MIX_SCHEMA)
 
-    # Since granularity is hourly, 1 MW for 1 hour = 1 MWh.
-    # Group by zone and date (extract date from datetime)
+    # With hourly samples, summing MW across hours gives daily energy in MWh.
+    # Create calendar date used as the daily aggregation grain.
     df = silver_mix.with_columns(
         pl.col("datetime").dt.date().alias("date")
     )
 
-    # Sum the production columns
+    # Source-level generation inputs from Silver.
     prod_cols = [
         "nuclear_mw", "geothermal_mw", "biomass_mw", "coal_mw",
         "wind_mw", "solar_mw", "hydro_mw", "gas_mw", "oil_mw", "unknown_mw"
     ]
 
-    # Perform aggregation
+    # Aggregate to daily source energy totals (MWh) per zone.
     agg_exprs = [
         pl.col(c).fill_null(0.0).sum().alias(c.replace("_mw", "_mwh")) for c in prod_cols
     ]
     agg_exprs.append(pl.col("datetime").n_unique().cast(pl.Int32).alias("hours_covered"))
-
     daily = df.group_by(["zone", "date", "year", "month"]).agg(agg_exprs)
 
-    # Calculate total production
+    # Build denominator for relative mix (% contribution by source).
     mwh_cols = [c.replace("_mw", "_mwh") for c in prod_cols]
-
-    # Sum all sources, treating nulls as 0
     daily = daily.with_columns(
         pl.sum_horizontal([pl.col(c).fill_null(0.0) for c in mwh_cols]).alias("total_production_mwh")
     )
 
-    # Calculate percentages
+    # Relative mix formula: source_pct = source_mwh / total_mwh * 100.
     for c in mwh_cols:
         pct_col = c.replace("_mwh", "_pct")
         daily = daily.with_columns(
@@ -76,11 +73,13 @@ def _aggregate_mix(silver_mix: pl.DataFrame, process_ts: int) -> pl.DataFrame:
             .alias(pct_col)
         )
 
-    # Simple proxies for fossil-free and renewable (a full implementation would be more robust)
+    # Derived portfolio-level shares computed as sum of source percentages.
+    # Note: column names use `_avg_pct`, but values are summed share contributions.
     fossil_free_cols = ["nuclear_pct", "geothermal_pct", "biomass_pct", "wind_pct", "solar_pct", "hydro_pct"]
     renewable_cols = ["geothermal_pct", "biomass_pct", "wind_pct", "solar_pct", "hydro_pct"]
 
     daily = daily.with_columns(
+        # `process_ts` is the transformation reference timestamp for this Gold batch.
         pl.lit(process_ts).cast(pl.Int64).alias("process_ts"),
         pl.col("zone").map_elements(get_zone_name, return_dtype=pl.Utf8).alias("zone_name"),
         pl.col("date").dt.day().alias("day"),
@@ -99,7 +98,7 @@ def _aggregate_mix(silver_mix: pl.DataFrame, process_ts: int) -> pl.DataFrame:
 
 
 # ------------------------------------------------------------------ #
-#  Flows Aggregation                                                  #
+#  Daily Net Flows                                                #
 # ------------------------------------------------------------------ #
 
 def _aggregate_flows(silver_flows: pl.DataFrame, process_ts: int) -> tuple[pl.DataFrame, pl.DataFrame]:
@@ -111,7 +110,7 @@ def _aggregate_flows(silver_flows: pl.DataFrame, process_ts: int) -> tuple[pl.Da
         pl.col("datetime").dt.date().alias("date")
     )
 
-    # Group by neighbor to calculate gross imports and exports
+    # Sum hourly power (MW) by direction to obtain daily gross energy (MWh).
     agg_df = df.group_by(["zone", "neighbor_zone", "date", "year", "month"]).agg([
         pl.col("power_mw").filter(pl.col("direction") == "import").sum().alias("gross_import_mwh"),
         pl.col("power_mw").filter(pl.col("direction") == "export").sum().alias("gross_export_mwh"),
@@ -127,12 +126,12 @@ def _aggregate_flows(silver_flows: pl.DataFrame, process_ts: int) -> tuple[pl.Da
         pl.col("date").dt.day().alias("day"),
     ])
 
-    # Calculate net flows: Net Import = Gross Import - Gross Export
+    # Compute net daily flow: positive indicates net import, negative indicates net export.
     agg_df = agg_df.with_columns(
         (pl.col("gross_import_mwh") - pl.col("gross_export_mwh")).alias("net_flow")
     )
 
-    # Imports: net_flow > 0
+    # Isolate net imports: label neighbor as source_zone and keep positive flow.
     imports_agg = agg_df.filter(pl.col("net_flow") > 0).with_columns([
         pl.col("net_flow").alias("import_mwh")
     ]).rename({"neighbor_zone": "source_zone", "neighbor_zone_name": "source_zone_name"}).select([
@@ -140,7 +139,7 @@ def _aggregate_flows(silver_flows: pl.DataFrame, process_ts: int) -> tuple[pl.Da
         "date", "import_mwh", "hours_covered", "year", "month", "day"
     ])
 
-    # Exports: net_flow < 0 (store as positive net_mwh value)
+    # Isolate net exports: label neighbor as destination_zone and flip sign to positive.
     exports_agg = agg_df.filter(pl.col("net_flow") < 0).with_columns([
         (pl.col("net_flow") * -1.0).alias("export_mwh")
     ]).rename({"neighbor_zone": "destination_zone", "neighbor_zone_name": "destination_zone_name"}).select([
@@ -315,7 +314,7 @@ def transform_gold(
     process_ts = process_ts or int(time.time() * 1000)
     so = settings.storage_options
 
-    # Step 1: Pick up ready silver batches
+    # Step 1: Identify all Silver batches ready for promotion.
     pending_ts = state.pickup_ready("silver")
     if not pending_ts:
         logger.info("gold_no_pending: No silver batches ready")
@@ -325,8 +324,7 @@ def transform_gold(
     state.init_layer("gold", process_ts)
 
     try:
-        # Step 2: Read minimal Silver columns to identify affected days,
-        # then load only those partitions for full aggregation.
+        # Step 2: Load only the physical partitions affected by the new data.
         silver_mix_ts = _read_delta_columns(
             f"{settings.silver_dir}/electricity_mix",
             so,
@@ -353,7 +351,7 @@ def transform_gold(
             affected_days,
         )
 
-        # Step 3: Aggregate and validate
+        # Step 3: Compute daily business products (Mix, Imports, Exports).
         gold_mix = GoldMixSchema.validate(_aggregate_mix(silver_mix, process_ts))
         gold_imports, gold_exports = _aggregate_flows(silver_flows, process_ts)
         gold_imports = GoldImportsSchema.validate(gold_imports)
@@ -364,7 +362,7 @@ def transform_gold(
             f"imports_records={len(gold_imports)}, exports_records={len(gold_exports)}"
         )
 
-        # Step 4: Write Delta Lake tables
+        # Step 4: Perform atomic overwrite of affected days in Gold Delta tables.
         partition_cols = ["year", "month", "day"]
 
         _overwrite_affected_days(
@@ -392,7 +390,7 @@ def transform_gold(
             partition_by=partition_cols,
         )
 
-        # Step 5: Update state
+        # Step 5: Advance the pipeline state for both Silver (consumed) and Gold (ready).
         total = len(gold_mix) + len(gold_imports) + len(gold_exports)
         state.mark_complete("silver", pending_ts)
         state.mark_ready("gold", process_ts, total)

@@ -159,8 +159,8 @@ class PipelineState:
     #  Queries                                                            #
     # ------------------------------------------------------------------ #
 
-    def get_last_end_timestamp(self, process: str) -> datetime | None:
-        """Return the latest ``end_timestamp`` for a process layer.
+    def get_last_process_ts(self, process: str) -> datetime | None:
+        """Return the latest ``process_ts`` for a process layer.
 
         Used by Bronze to determine the catch-up start time.
         """
@@ -168,15 +168,21 @@ class PipelineState:
         if df.is_empty():
             return None
 
-        layer = df.filter(
-            (pl.col("process") == process)
-            & (pl.col("end_timestamp").is_not_null())
+        # Filter by process and ensure status is not null (as per user request: null indicates didn't complete)
+        layer = (
+            df.filter(
+                (pl.col("process") == process)
+                & (pl.col("status").is_not_null())
+            )
+            .sort("process_ts", descending=True)
         )
+
         if layer.is_empty():
             return None
 
-        val = layer["end_timestamp"].max()
-        return tp.cast(datetime, val) if val is not None else None
+        # Get the process_ts from the most recent run and convert to datetime
+        ts_ms = layer.item(0, "process_ts")
+        return datetime.fromtimestamp(ts_ms / 1000.0, UTC)
 
     def get_state_summary(self) -> pl.DataFrame:
         """Return the full ``el_state`` table for monitoring / debugging."""

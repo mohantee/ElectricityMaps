@@ -22,7 +22,7 @@ The solution is designed for analytics on energy transition trends and includes 
 | Processing framework | Polars + Delta Lake (`deltalake-rs`) | Fast single-node processing with an open table format for reliable downstream analytics. |
 | Bronze storage model | Raw immutable envelope with metadata | Preserves exact API payload plus lineage fields (`ingestion_timestamp`, `source_url`, `zone`, range). |
 | Orchestration pattern | Decoupled Airflow DAGs + `el_state` state machine (`I -> R -> P -> C`) | Enables independent layer scheduling while preserving deterministic handoff and status tracking. |
-| Storage strategy | S3-backed Delta tables + batch Parquet extracts | Meets table-management needs and explicit Parquet deliverable requirements for Silver/Gold. |
+| Storage strategy | S3-backed Delta tables | Fast, reliable ACID transactions on S3 using Polars + Delta-rs. |
 | Deployment scope | Single-node deployment with Docker + Docker Compose | Keeps operations simple for assignment scale while remaining reproducible and easy to run end-to-end. |
 | Validation and DQ | Pydantic for API contracts + Pandera for DataFrames + bad-data tables | Enforces typed schemas and captures parse/schema failures without stopping valid data flow. |
 | Reliability | HTTP retry/backoff, stateful error recording, CI gate | Handles rate limits/transient failures and improves operational confidence before deployment. |
@@ -41,13 +41,13 @@ Airflow orchestrates independent layer runs through `el_state`, while notebooks 
 
 - **Ingestion**: Electricity Maps API (`electricity-mix/past-range`, `electricity-flows/past-range`)
 - **Storage**:
-  - Bronze raw Parquet
-  - Silver Delta + batch Parquet export
-  - Gold Delta + batch Parquet export
+  - Bronze Delta Table (Raw envelope)
+  - Silver Delta Tables (Cleaned/Flattened)
+  - Gold Delta Tables (Aggregated Business Products)
   - `state/el_state` Delta table for process tracking
 - **Orchestration**: 3 decoupled Airflow DAGs
-- **Analytics**: DuckDB notebook queries on Delta/Parquet
-- **RAG design**: see [`rag_architecture_design.md`](./rag_architecture_design.md)
+- **Analytics**: DuckDB notebook queries on Delta tables
+- **RAG design**: see [`rag_architecture_design.md`](./rag_architecture_design.md) (uses Google Generative AI embeddings)
 
 ### Layer Sequence Diagram
 
@@ -133,12 +133,14 @@ Use environment-specific properties for test/prod separation.
 docker-compose up -d --build
 ```
 
-Airflow UI: `http://localhost:8080`
+Airflow UI: `http://localhost:8080` (Local)
 
 DAGs:
 - `electricity_maps_bronze` (`@hourly`)
 - `electricity_maps_silver` (`10 * * * *`)
 - `electricity_maps_gold` (`20 * * * *`)
+
+![Airflow DAGs](./docs/images/airflow_dags.png)
 
 ### Option B: Python layer execution
 
@@ -154,12 +156,12 @@ transform_gold()
 
 ### Option C: Notebooks
 
-- `01_api_exploration.ipynb`: validate endpoints and schema shape
-- `02_bronze_ingestion.ipynb`: test bronze ingest
-- `03_silver_transform.ipynb`: test silver transformation
-- `04_gold_aggregation.ipynb`: test gold transformation
-- `05_query_delta_sql.ipynb`: Query util: to inspect the data in S3
-- `06_rag_chatbot.ipynb`: hybrid SQL + document RAG demo
+- [`01_api_exploration.ipynb`](./notebooks/01_api_exploration.ipynb): validate endpoints and schema shape
+- [`02_bronze_ingestion.ipynb`](./notebooks/02_bronze_ingestion.ipynb): test bronze ingest
+- [`03_silver_transform.ipynb`](./notebooks/03_silver_transform.ipynb): test silver transformation
+- [`04_gold_aggregation.ipynb`](./notebooks/04_gold_aggregation.ipynb): test gold transformation
+- [`05_query_delta_sql.ipynb`](./notebooks/05_query_delta_sql.ipynb): Query util: to inspect the data in S3
+- [`06_rag_chatbot.ipynb`](./notebooks/06_rag_chatbot.ipynb): hybrid SQL + document RAG demo
 
 ## Data Layer Schemas (Required Submission Item)
 
@@ -173,7 +175,7 @@ transform_gold()
   - `zone`
   - `range_start`, `range_end`
   - `record_count`
-- Partitioning: ingestion date (`year/month/day`)
+- **Partitioning**: `year`, `month`, `day` (ingestion date)
 
 ### Silver
 
@@ -218,11 +220,11 @@ s3://electricity-maps/data/
 
 Sample result prints are captured in notebook outputs:
 
-- `notebooks/03_silver_transform.ipynb`
+- [`notebooks/03_silver_transform.ipynb`](./notebooks/03_silver_transform.ipynb)
   - `Silver transformation result: {'process_ts': ..., 'mix_records': ..., 'flows_records': ...}`
-- `notebooks/04_gold_aggregation.ipynb`
+- [`notebooks/04_gold_aggregation.ipynb`](./notebooks/04_gold_aggregation.ipynb)
   - `Gold transformation result: {'process_ts': ..., 'mix_records': ..., 'imports_records': ..., 'exports_records': ...}`
-- `notebooks/05_query_delta_sql.ipynb`
+- [`notebooks/05_query_delta_sql.ipynb`](./notebooks/05_query_delta_sql.ipynb)
   - query snapshots for Bronze/Silver/Gold summary views
 
 
@@ -260,7 +262,7 @@ Data quality controls:
 ## Incremental / Catch-up Design
 
 - Bronze windowing:
-  - `start = last bronze end_timestamp (floored to hour)` or fallback `now - 24h`
+  - `start = last bronze process_ts (floored to hour)` or fallback `now - 24h`
   - `end = current hour (floored)`
 - Silver and Gold process only `el_state` rows in `R` state claimed to `P`.
 - Ensures missed windows are automatically backfilled after downtime.
