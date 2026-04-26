@@ -50,7 +50,7 @@ def _calculate_time_range(
     # Ensure we have at least 1 hour to fetch
     if start >= end:
         start = end - timedelta(hours=1)
-        
+
 
     return start, end
 
