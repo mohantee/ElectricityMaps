@@ -9,11 +9,9 @@ Key quirks handled:
 
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Optional
+import datetime as dt
 
 from pydantic import BaseModel, Field
-
 
 # ------------------------------------------------------------------ #
 #  Electricity Mix models                                             #
@@ -21,31 +19,31 @@ from pydantic import BaseModel, Field
 
 class StorageData(BaseModel):
     """Nested charge/discharge values for hydro or battery storage."""
-    charge: Optional[float] = None
-    discharge: Optional[float] = None
+    charge: float | None = None
+    discharge: float | None = None
 
 
 class FlowsAggregate(BaseModel):
     """Aggregate import/export totals inside the mix response."""
-    exports: Optional[float] = None
-    imports: Optional[float] = None
+    exports: float | None = None
+    imports: float | None = None
 
 
 class MixData(BaseModel):
     """Energy source breakdown for a single hourly record."""
-    nuclear: Optional[float] = None
-    geothermal: Optional[float] = None
-    biomass: Optional[float] = None
-    coal: Optional[float] = None
-    wind: Optional[float] = None
-    solar: Optional[float] = None
-    hydro: Optional[float] = None
-    gas: Optional[float] = None
-    oil: Optional[float] = None
-    unknown: Optional[float] = None
-    hydro_storage: Optional[StorageData] = Field(None, alias="hydro storage")
-    battery_storage: Optional[StorageData] = Field(None, alias="battery storage")
-    flows: Optional[FlowsAggregate] = None
+    nuclear: float | None = None
+    geothermal: float | None = None
+    biomass: float | None = None
+    coal: float | None = None
+    wind: float | None = None
+    solar: float | None = None
+    hydro: float | None = None
+    gas: float | None = None
+    oil: float | None = None
+    unknown: float | None = None
+    hydro_storage: StorageData | None = Field(None, alias="hydro storage")
+    battery_storage: StorageData | None = Field(None, alias="battery storage")
+    flows: FlowsAggregate | None = None
 
     model_config = {"populate_by_name": True}
 
@@ -54,8 +52,8 @@ class MixRecord(BaseModel):
     """A single hourly record in the electricity mix response."""
     datetime: datetime
     updated_at: datetime = Field(alias="updatedAt")
-    is_estimated: Optional[bool] = Field(None, alias="isEstimated")
-    estimation_method: Optional[str] = Field(None, alias="estimationMethod")
+    is_estimated: bool | None = Field(None, alias="isEstimated")
+    estimation_method: str | None = Field(None, alias="estimationMethod")
     mix: MixData
 
     model_config = {"populate_by_name": True}
@@ -79,8 +77,8 @@ class FlowsRecord(BaseModel):
     """A single hourly record in the electricity flows response."""
     datetime: datetime
     updated_at: datetime = Field(alias="updatedAt")
-    import_flows: Optional[dict[str, float]] = Field(None, alias="import")
-    export_flows: Optional[dict[str, float]] = Field(None, alias="export")
+    import_flows: dict[str, float] | None = Field(None, alias="import")
+    export_flows: dict[str, float] | None = Field(None, alias="export")
 
     model_config = {"populate_by_name": True}
 

@@ -24,7 +24,7 @@ with DAG(
     "electricity_maps_gold",
     default_args=default_args,
     description="Aggregate Silver data to Gold layer daily tables",
-    schedule_interval="@daily",
+    schedule_interval="20 * * * *",  # 20 minutes past the hour
     start_date=datetime(2026, 4, 20),
     catchup=False,
     tags=["electricity_maps", "gold"],

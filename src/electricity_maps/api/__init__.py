@@ -7,7 +7,7 @@ from electricity_maps.api.models import (
 )
 
 __all__ = [
+    "ElectricityFlowsResponse",
     "ElectricityMapsClient",
     "ElectricityMixResponse",
-    "ElectricityFlowsResponse",
 ]

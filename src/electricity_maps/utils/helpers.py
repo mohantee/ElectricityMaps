@@ -13,7 +13,6 @@ from deltalake import DeltaTable
 
 from electricity_maps.config import Settings
 
-
 # ================================================================
 # Datetime helpers
 # ================================================================
@@ -28,14 +27,21 @@ def floor_to_hour(dt: datetime) -> datetime:
 # ================================================================
 
 def get_s3fs(settings: Settings) -> s3fs.S3FileSystem:
-    """Build an authenticated S3FileSystem.
+    """Build an authenticated S3FileSystem or LocalFileSystem based on settings.
+    
+    If settings.emaps_data_dir is a local path (doesn't start with 's3://'),
+    returns a LocalFileSystem for local storage/testing.
     
     Args:
-        settings: Pipeline settings containing AWS credentials.
+        settings: Pipeline settings containing AWS credentials or local path.
         
     Returns:
-        Authenticated s3fs.S3FileSystem instance.
+        fsspec filesystem instance (S3FileSystem or LocalFileSystem).
     """
+    if not settings.data_dir.startswith("s3://"):
+        import fsspec
+        return fsspec.filesystem("file")
+
     return s3fs.S3FileSystem(
         key=settings.aws_access_key_id,
         secret=settings.aws_secret_access_key,
@@ -77,11 +83,16 @@ def find_bronze_files(
     Returns:
         List of full S3 paths matching the pattern.
     """
-    pattern = f"{bronze_dir}/{stream}/**/{ zone}_{process_ts}.parquet"
-    # Remove s3:// prefix for s3fs glob
+    is_s3 = bronze_dir.startswith("s3://")
+    pattern = f"{bronze_dir}/{stream}/**/{zone}_{process_ts}.parquet"
+
+    # Remove s3:// prefix for fsspec glob if present
     clean = pattern.replace("s3://", "")
     files = fs.glob(clean)
-    return [f"s3://{f}" for f in files]
+
+    if is_s3:
+        return [f"s3://{f}" for f in files]
+    return files
 
 
 # ================================================================

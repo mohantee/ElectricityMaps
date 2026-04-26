@@ -21,10 +21,6 @@ from tenacity import (
     wait_exponential,
 )
 
-from electricity_maps.api.models import (
-    ElectricityFlowsResponse,
-    ElectricityMixResponse,
-)
 from electricity_maps.config import Settings, get_settings
 
 logger = logging.getLogger(__name__)
@@ -52,9 +48,7 @@ def _is_retriable(exc: BaseException) -> bool:
         return True
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code >= 500
-    if isinstance(exc, (httpx.ConnectError, httpx.TimeoutException)):
-        return True
-    return False
+    return isinstance(exc, (httpx.ConnectError, httpx.TimeoutException))
 
 
 # ------------------------------------------------------------------ #
@@ -99,7 +93,7 @@ class ElectricityMapsClient:
         stop=stop_after_attempt(5),
         wait=wait_exponential(multiplier=1, min=2, max=60),
         retry=retry_if_exception(_is_retriable),
-        before_sleep=before_sleep_log(logger, logging.WARNING),
+        before_sleep=before_sleep_log(logging.getLogger("tenacity"), logging.WARNING),
         reraise=True,
     )
     def _request(self, endpoint: str, params: dict) -> dict:

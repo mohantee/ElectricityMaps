@@ -9,60 +9,59 @@ from __future__ import annotations
 import pandera.polars as pa
 import polars as pl
 
-
 # ================================================================
 # Polars Schema Dictionaries
 # ================================================================
 
-BAD_DATA_SCHEMA = {
-    "process_ts": pl.Int64,
-    "datetime": pl.Utf8,
-    "raw_json": pl.Utf8,
-    "error_message": pl.Utf8,
+BAD_DATA_SCHEMA: dict[str, pl.DataType] = {
+    "process_ts": pl.Int64(),
+    "datetime": pl.Utf8(),
+    "raw_json": pl.Utf8(),
+    "error_message": pl.Utf8(),
     "created_at": pl.Datetime("us", "UTC"),
 }
 
 
-MIX_SCHEMA = {
-    "process_ts": pl.Int64,
-    "zone": pl.Utf8,
+MIX_SCHEMA: dict[str, pl.DataType] = {
+    "process_ts": pl.Int64(),
+    "zone": pl.Utf8(),
     "datetime": pl.Datetime("us", "UTC"),
     "updated_at": pl.Datetime("us", "UTC"),
-    "is_estimated": pl.Boolean,
-    "estimation_method": pl.Utf8,
-    "nuclear_mw": pl.Float64,
-    "geothermal_mw": pl.Float64,
-    "biomass_mw": pl.Float64,
-    "coal_mw": pl.Float64,
-    "wind_mw": pl.Float64,
-    "solar_mw": pl.Float64,
-    "hydro_mw": pl.Float64,
-    "gas_mw": pl.Float64,
-    "oil_mw": pl.Float64,
-    "unknown_mw": pl.Float64,
-    "hydro_storage_charge_mw": pl.Float64,
-    "hydro_storage_discharge_mw": pl.Float64,
-    "battery_storage_charge_mw": pl.Float64,
-    "battery_storage_discharge_mw": pl.Float64,
-    "flow_exports_mw": pl.Float64,
-    "flow_imports_mw": pl.Float64,
-    "year": pl.Int32,
-    "month": pl.Int32,
-    "day": pl.Int32,
+    "is_estimated": pl.Boolean(),
+    "estimation_method": pl.Utf8(),
+    "nuclear_mw": pl.Float64(),
+    "geothermal_mw": pl.Float64(),
+    "biomass_mw": pl.Float64(),
+    "coal_mw": pl.Float64(),
+    "wind_mw": pl.Float64(),
+    "solar_mw": pl.Float64(),
+    "hydro_mw": pl.Float64(),
+    "gas_mw": pl.Float64(),
+    "oil_mw": pl.Float64(),
+    "unknown_mw": pl.Float64(),
+    "hydro_storage_charge_mw": pl.Float64(),
+    "hydro_storage_discharge_mw": pl.Float64(),
+    "battery_storage_charge_mw": pl.Float64(),
+    "battery_storage_discharge_mw": pl.Float64(),
+    "flow_exports_mw": pl.Float64(),
+    "flow_imports_mw": pl.Float64(),
+    "year": pl.Int32(),
+    "month": pl.Int32(),
+    "day": pl.Int32(),
 }
 
 
-FLOWS_SCHEMA = {
-    "process_ts": pl.Int64,
-    "zone": pl.Utf8,
+FLOWS_SCHEMA: dict[str, pl.DataType] = {
+    "process_ts": pl.Int64(),
+    "zone": pl.Utf8(),
     "datetime": pl.Datetime("us", "UTC"),
     "updated_at": pl.Datetime("us", "UTC"),
-    "neighbor_zone": pl.Utf8,
-    "direction": pl.Utf8,
-    "power_mw": pl.Float64,
-    "year": pl.Int32,
-    "month": pl.Int32,
-    "day": pl.Int32,
+    "neighbor_zone": pl.Utf8(),
+    "direction": pl.Utf8(),
+    "power_mw": pl.Float64(),
+    "year": pl.Int32(),
+    "month": pl.Int32(),
+    "day": pl.Int32(),
 }
 
 
@@ -76,8 +75,8 @@ class SilverMixSchema(pa.DataFrameModel):
 
     process_ts: pl.Int64
     zone: pl.Utf8
-    datetime: pl.Datetime("us", "UTC")
-    updated_at: pl.Datetime("us", "UTC")
+    datetime: pl.Datetime
+    updated_at: pl.Datetime
     is_estimated: pl.Boolean = pa.Field(nullable=True)
     estimation_method: pl.Utf8 = pa.Field(nullable=True)
 
@@ -118,8 +117,8 @@ class SilverFlowsSchema(pa.DataFrameModel):
 
     process_ts: pl.Int64
     zone: pl.Utf8
-    datetime: pl.Datetime("us", "UTC")
-    updated_at: pl.Datetime("us", "UTC")
+    datetime: pl.Datetime
+    updated_at: pl.Datetime
     neighbor_zone: pl.Utf8
     direction: pl.Utf8 = pa.Field(isin=["import", "export"])
     power_mw: pl.Float64

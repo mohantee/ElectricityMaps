@@ -10,7 +10,7 @@ State machine per row: **I → R → P → C**
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import polars as pl
 from deltalake import DeltaTable, write_deltalake
@@ -58,7 +58,7 @@ class PipelineState:
             process_ts: Epoch-ms batch identifier.
             start_ts: When processing started (defaults to now UTC).
         """
-        start_ts = start_ts or datetime.now(timezone.utc)
+        start_ts = start_ts or datetime.now(UTC)
         row = pl.DataFrame(
             {
                 "process": [process],
@@ -88,7 +88,7 @@ class PipelineState:
             record_count: Number of records produced.
             end_ts: When processing finished (defaults to now UTC).
         """
-        end_ts = end_ts or datetime.now(timezone.utc)
+        end_ts = end_ts or datetime.now(UTC)
         self._update_status(
             process=process,
             process_ts=process_ts,

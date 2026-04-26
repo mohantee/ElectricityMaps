@@ -10,11 +10,12 @@ Bad records are routed to separate bad-data Delta tables.
 from __future__ import annotations
 
 import json
+import logging
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import polars as pl
-import s3fs
+import pandera.polars as pa
 from deltalake import write_deltalake
 
 from electricity_maps.config import Settings, get_settings
@@ -27,8 +28,6 @@ from electricity_maps.schemas.silver_schemas import (
 )
 from electricity_maps.utils.helpers import find_bronze_files, get_s3fs, read_bronze_parquet
 from electricity_maps.utils.state import PipelineState
-
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -58,13 +57,13 @@ def _bad_row(
         "datetime": str(row_datetime or "unknown"),
         "raw_json": row if isinstance(row, str) else json.dumps(row, default=str),
         "error_message": error_message,
-        "created_at": datetime.now(timezone.utc),
+        "created_at": datetime.now(UTC),
     }
 
 
 def _validate_rows(
     df: pl.DataFrame,
-    schema_model: type,
+    schema_model: type[pa.DataFrameModel],
     process_ts: int,
     empty_schema: dict[str, pl.DataType],
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
@@ -350,10 +349,10 @@ def transform_silver(
     # Step 1: Pick up ready bronze batches
     pending_ts = state.pickup_ready("bronze")
     if not pending_ts:
-        logger.info("silver_no_pending", msg="No bronze batches ready")
+        logger.info("silver_no_pending: No bronze batches ready")
         return {"status": "no_pending", "mix_records": 0, "flows_records": 0}
 
-    logger.info("silver_started", process_ts=process_ts, bronze_batches=len(pending_ts))
+    logger.info(f"silver_started: process_ts={process_ts}, bronze_batches={len(pending_ts)}")
     state.init_layer("silver", process_ts)
 
     try:
@@ -362,7 +361,7 @@ def transform_silver(
         all_flows_good = []
         all_flows_bad = []
 
-        # Step 2–5: Process each bronze batch
+        # Step 2-5: Process each bronze batch
         for bts in pending_ts:
             # Find and read mix files
             mix_files = find_bronze_files(
@@ -401,11 +400,8 @@ def transform_silver(
         flows_bad = _concat_or_empty([flows_bad, flows_schema_bad], BAD_DATA_SCHEMA)
 
         logger.info(
-            "silver_transformed",
-            mix_good=len(mix_df),
-            mix_bad=len(mix_bad),
-            flows_good=len(flows_df),
-            flows_bad=len(flows_bad),
+            f"silver_transformed: mix_good={len(mix_df)}, mix_bad={len(mix_bad)}, "
+            f"flows_good={len(flows_df)}, flows_bad={len(flows_bad)}"
         )
 
         # Step 8: Write Delta Lake tables
@@ -445,11 +441,8 @@ def transform_silver(
         state.mark_ready("silver", process_ts, total)
 
         logger.info(
-            "silver_completed",
-            mix_records=len(mix_df),
-            flows_records=len(flows_df),
-            bad_mix=len(mix_bad),
-            bad_flows=len(flows_bad),
+            f"silver_completed: mix_records={len(mix_df)}, flows_records={len(flows_df)}, "
+            f"bad_mix={len(mix_bad)}, bad_flows={len(flows_bad)}"
         )
 
         return {
@@ -462,6 +455,6 @@ def transform_silver(
         }
 
     except Exception as e:
-        logger.error("silver_failed", error=str(e), process_ts=process_ts)
+        logger.error(f"silver_failed: error={e}, process_ts={process_ts}")
         state.mark_error("silver", process_ts, str(e))
         raise

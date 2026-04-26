@@ -7,6 +7,7 @@ Results are written as partitioned Delta Lake tables.
 
 from __future__ import annotations
 
+import logging
 import time
 
 import polars as pl
@@ -23,8 +24,6 @@ from electricity_maps.schemas.gold_schemas import (
 )
 from electricity_maps.utils.helpers import filter_by_process_ts, get_zone_name, read_delta_table
 from electricity_maps.utils.state import PipelineState
-
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -169,13 +168,16 @@ def _affected_days(*frames: pl.DataFrame) -> list[tuple[int, int, int]]:
 
 def _filter_to_days(df: pl.DataFrame, days: list[tuple[int, int, int]]) -> pl.DataFrame:
     """Filter DataFrame to only rows with specified (year, month, day) combinations."""
-    if df.is_empty() or not days:
+    if not days:
         return df.head(0)
 
-    predicate = None
+    predicate: pl.Expr | None = None
     for year, month, day in days:
         day_expr = (pl.col("year") == year) & (pl.col("month") == month) & (pl.col("day") == day)
         predicate = day_expr if predicate is None else predicate | day_expr
+
+    if predicate is None:
+        return df.head(0)
     return df.filter(predicate)
 
 
@@ -252,10 +254,10 @@ def transform_gold(
     # Step 1: Pick up ready silver batches
     pending_ts = state.pickup_ready("silver")
     if not pending_ts:
-        logger.info("gold_no_pending", msg="No silver batches ready")
+        logger.info("gold_no_pending: No silver batches ready")
         return {"status": "no_pending", "mix_records": 0, "imports_records": 0, "exports_records": 0}
 
-    logger.info("gold_started", process_ts=process_ts, silver_batches=len(pending_ts))
+    logger.info(f"gold_started: process_ts={process_ts}, silver_batches={len(pending_ts)}")
     state.init_layer("gold", process_ts)
 
     try:
@@ -277,15 +279,12 @@ def transform_gold(
         gold_exports = GoldExportsSchema.validate(gold_exports)
 
         logger.info(
-            "gold_aggregated",
-            mix_records=len(gold_mix),
-            imports_records=len(gold_imports),
-            exports_records=len(gold_exports),
+            f"gold_aggregated: mix_records={len(gold_mix)}, "
+            f"imports_records={len(gold_imports)}, exports_records={len(gold_exports)}"
         )
 
         # Step 4: Write Delta Lake tables
         partition_cols = ["year", "month", "day"]
-        predicate = _predicate_for_days(affected_days)
 
         _merge_write_delta(
             gold_mix,
@@ -312,10 +311,8 @@ def transform_gold(
         state.mark_ready("gold", process_ts, total)
 
         logger.info(
-            "gold_completed",
-            mix_records=len(gold_mix),
-            imports_records=len(gold_imports),
-            exports_records=len(gold_exports),
+            f"gold_completed: mix_records={len(gold_mix)}, "
+            f"imports_records={len(gold_imports)}, exports_records={len(gold_exports)}"
         )
 
         return {
@@ -327,6 +324,6 @@ def transform_gold(
         }
 
     except Exception as e:
-        logger.error("gold_failed", error=str(e), process_ts=process_ts)
+        logger.error(f"gold_failed: error={e}, process_ts={process_ts}")
         state.mark_error("gold", process_ts, str(e))
         raise

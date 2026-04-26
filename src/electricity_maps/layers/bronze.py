@@ -10,8 +10,10 @@ Catch-up: automatically ingests all missing data since the last run.
 from __future__ import annotations
 
 import json
+import logging
+import os
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from io import BytesIO
 
 import pyarrow as pa
@@ -23,8 +25,6 @@ from electricity_maps.config import Settings, get_settings
 from electricity_maps.utils.helpers import floor_to_hour, get_s3fs
 from electricity_maps.utils.partitioning import build_bronze_key
 from electricity_maps.utils.state import PipelineState
-
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -46,10 +46,10 @@ def _calculate_time_range(
     if last_end is not None:
         start = floor_to_hour(last_end)
     else:
-        start = floor_to_hour(datetime.now(timezone.utc) - timedelta(hours=24))
-        logger.info("no_prior_run", defaulting_start_to=str(start))
+        start = floor_to_hour(datetime.now(UTC) - timedelta(hours=24))
+        logger.info(f"no_prior_run: defaulting_start_to={start}")
 
-    end = floor_to_hour(datetime.now(timezone.utc))
+    end = floor_to_hour(datetime.now(UTC))
 
     # Ensure we have at least 1 hour to fetch
     if start >= end:
@@ -87,6 +87,9 @@ def _write_parquet_to_s3(
     pq.write_table(table, buf)
     buf.seek(0)
 
+    # Ensure parent directory exists (needed for local filesystem in tests)
+    fs.makedirs(os.path.dirname(s3_key), exist_ok=True)
+
     with fs.open(s3_key, "wb") as f:
         f.write(buf.read())
 
@@ -114,16 +117,16 @@ def ingest_bronze(
     settings = settings or get_settings()
     state = PipelineState(settings)
     process_ts = process_ts or int(time.time() * 1000)
-    ingestion_ts = datetime.now(timezone.utc)
+    ingestion_ts = datetime.now(UTC)
 
     # Step 1: Init state
     state.init_layer("bronze", process_ts, ingestion_ts)
-    logger.info("bronze_started", process_ts=process_ts)
+    logger.info(f"bronze_started: process_ts={process_ts}")
 
     try:
         # Step 2: Calculate time range
         start, end = _calculate_time_range(state, settings)
-        logger.info("bronze_time_range", start=str(start), end=str(end))
+        logger.info(f"bronze_time_range: start={start}, end={end}")
 
         # Step 3: Fetch from API
         with ElectricityMapsClient(settings) as client:
@@ -133,9 +136,7 @@ def ingest_bronze(
         mix_count = len(raw_mix.get("data", []))
         flows_count = len(raw_flows.get("data", []))
         logger.info(
-            "bronze_api_fetched",
-            mix_records=mix_count,
-            flows_records=flows_count,
+            f"bronze_api_fetched: mix_records={mix_count}, flows_records={flows_count}"
         )
 
         # Step 4: Build metadata values stored outside raw_json
@@ -181,12 +182,12 @@ def ingest_bronze(
             start=start,
             end=end,
         )
-        logger.info("bronze_written_to_s3", mix_key=mix_key, flows_key=flows_key)
+        logger.info(f"bronze_written_to_s3: mix_key={mix_key}, flows_key={flows_key}")
 
         # Step 6: Mark ready
         total_records = mix_count + flows_count
         state.mark_ready("bronze", process_ts, total_records)
-        logger.info("bronze_completed", total_records=total_records)
+        logger.info(f"bronze_completed: total_records={total_records}")
 
         return {
             "process_ts": process_ts,
@@ -199,6 +200,6 @@ def ingest_bronze(
         }
 
     except Exception as e:
-        logger.error("bronze_failed", error=str(e), process_ts=process_ts)
+        logger.error(f"bronze_failed: error={e}, process_ts={process_ts}")
         state.mark_error("bronze", process_ts, str(e))
         raise

@@ -11,8 +11,9 @@
 | Config | **pydantic-settings** | Typed `.env` config |
 | Orchestration | **Apache Airflow** | Industry-standard ETL scheduler |
 | Containerization | **Docker + docker-compose** | Reproducible, pairs with Airflow |
-| Testing | **Jupyter Notebooks** | Interactive pipeline testing |
-| CI/CD | **GitHub Actions** | Lint + test |
+| Cloud Storage | **AWS S3 + s3fs + UPath** | Object storage for Delta tables and raw data |
+| Data Analytics | **DuckDB** | In-process SQL engine for fast queries on S3 Delta tables |
+| AI / LLM | **LangChain + Gemini + ChromaDB** | Orchestration, reasoning, and vector search for Hybrid RAG |
 | State Tracking | **`el_state` Delta table** | Pipeline event/status tracking |
 
 > [!NOTE]
@@ -87,6 +88,20 @@ This ensures **no data gaps** if the pipeline is down for hours — it catches u
 > - Some values are `null` (geothermal, unknown) — must handle nullable fields
 > - Records that **fail to parse** → written to bad data tables (raw JSON preserved)
 
+### 2.9. Bronze Layer Schema (Envelope)
+Raw data is stored as Parquet files with an metadata envelope.
+
+| Column | Type | Source |
+|---|---|---|
+| `process_ts` | `Int64` | Epoch-ms batch identifier |
+| `ingestion_timestamp` | `Datetime(us, UTC)` | When the record was fetched |
+| `source_url` | `Utf8` | The API URL called |
+| `zone` | `Utf8` | API Zone (e.g. FR) |
+| `range_start` | `Datetime(us, UTC)` | Start of requested range |
+| `range_end` | `Datetime(us, UTC)` | End of requested range |
+| `raw_json` | `Utf8` | Full raw JSON response |
+| `record_count` | `Int64` | Number of records in `data` array |
+
 ---
 
 ## 3. `el_state` Table Design (Pipeline State Tracking)
@@ -105,11 +120,11 @@ State machine per row: **`I` → `R` → `P` → `C`**
 | Column | Type | Description |
 |---|---|---|
 | `process` | `Utf8` | Layer name: `bronze`, `silver`, `gold` |
-| `process_ts` | `Int64` | Epoch timestamp(with ms) — unique batch identifier, links layers |
+| `process_ts` | `Int64` | Epoch-ms timestamp — unique batch identifier |
 | `start_timestamp` | `Datetime(us, UTC)` | When this layer started processing |
-| `end_timestamp` | `Datetime(us, UTC)` (nullable) | When this layer finished (null while status=I) |
+| `end_timestamp` | `Datetime(us, UTC)` (nullable) | When this layer finished |
 | `status` | `Utf8` | `I` / `R` / `P` / `C` |
-| `record_count` | `Int64` (nullable) | Number of records processed (null while status=I) |
+| `record_count` | `Int64` (nullable) | Number of records processed |
 | `error_message` | `Utf8` (nullable) | Error details if any |
 
 ### Example Data Flow
@@ -212,8 +227,8 @@ ElectricityMaps/
 │   ├── 02_bronze_ingestion.ipynb      # Test bronze layer
 │   ├── 03_silver_transform.ipynb      # Test silver transforms
 │   ├── 04_gold_aggregation.ipynb      # Test gold products
-│   ├── 05_pipeline_e2e.ipynb          # Full pipeline test
-│   └── 06_query_delta_sql.ipynb       # DuckDB SQL queries on Delta tables
+│   ├── 05_query_delta_sql.ipynb       # DuckDB SQL queries on S3 Delta tables
+│   └── 06_rag_chatbot.ipynb           # Hybrid RAG chatbot demo (SQL Agent + Document RAG)
 ├── src/
 │   └── electricity_maps/
 │       ├── __init__.py
@@ -247,43 +262,41 @@ ElectricityMaps/
 │       ├── mix_history_response.json   # Saved from notebook 01
 │       └── flows_history_response.json
 ├── docs/
-│   └── architecture.md
-├── data/                              # .gitignore'd
+│   └── Electricity_Maps_doc.pdf
+├── data (On S3 delta lake)/                              
 │   ├── bronze/
 │   ├── silver/
 │   ├── gold/
 │   └── state/
-└── sample_outputs/
 ```
 
 ### Environment Config Strategy
 
 ```
 config/
-├── prod.env        ← Active. Contains real API key, prod data dir
-├── test.env        ← For pytest. Points to test fixtures, mock API
-├── dev.env         ← Future. Local dev overrides
-└── .env.example    ← Template committed to git (no secrets)
+├── env_dev.properties         ← Active. Contains real API key, prod data dir
+├── env_test.properties        ← For pytest. Points to test fixtures, mock API
+├── env_prod.properties        ← Future. Local dev overrides
 ```
 
 **`config/prod.env`** (gitignored):
 ```env
 EMAPS_ENV=prod
-EMAPS_API_KEY=<real-key>
+EMAPS_API_KEY=<placeholder> #ToDo: Move to secrets
 EMAPS_API_BASE_URL=https://api.electricitymaps.com/v4
-EMAPS_DATA_DIR=./data
 EMAPS_ZONE=FR
-LLM_API_KEY=<llm-key>
+LLM_API_KEY=<placeholder>
+LLM_MODEL=gemini-3.1-flash-lite-preview
+
+#AWS bucket details
+EMAPS_DATA_DIR=s3://electricity-maps/data
+AWS_ACCESS_KEY_ID=<placeholder> #ToDo: Move to secrets
+AWS_SECRET_ACCESS_KEY=<placeholder> #ToDo: Move to secrets
+AWS_REGION=ap-south-1
+
 ```
 
-**`config/test.env`**:
-```env
-EMAPS_ENV=test
-EMAPS_API_KEY=test-key
-EMAPS_API_BASE_URL=http://localhost:8888/mock
-EMAPS_DATA_DIR=./tests/test_data
-EMAPS_ZONE=FR
-```
+
 
 **Config loader** (`config.py`):
 ```python
@@ -303,8 +316,7 @@ class Settings(BaseSettings):
 ### .gitignore (keys + secrets)
 ```gitignore
 # Secrets & keys
-config/prod.env
-config/dev.env
+config/env*.properties
 *.key
 *.pem
 
@@ -389,11 +401,12 @@ data/bronze/electricity_flows/year=2026/month=04/day=24/FR_1745489400.parquet
 #### Silver Table: `electricity_mix`
 | Column | Type | Source |
 |---|---|---|
+| `process_ts` | `Int64` | Batch ID |
 | `zone` | `Utf8` | Top-level `zone` |
-| `datetime` | `Datetime(us, UTC)` | `history[].datetime` |
-| `updated_at` | `Datetime(us, UTC)` | `history[].updatedAt` |
-| `is_estimated` | `Boolean` | `history[].isEstimated` |
-| `estimation_method` | `Utf8` (nullable) | `history[].estimationMethod` |
+| `datetime` | `Datetime(us, UTC)` | `data[].datetime` |
+| `updated_at` | `Datetime(us, UTC)` | `data[].updatedAt` |
+| `is_estimated` | `Boolean` | `data[].isEstimated` |
+| `estimation_method` | `Utf8` (nullable) | `data[].estimationMethod` |
 | `nuclear_mw` | `Float64` | `mix.nuclear` |
 | `geothermal_mw` | `Float64` (nullable) | `mix.geothermal` |
 | `biomass_mw` | `Float64` | `mix.biomass` |
@@ -410,16 +423,17 @@ data/bronze/electricity_flows/year=2026/month=04/day=24/FR_1745489400.parquet
 | `battery_storage_discharge_mw` | `Float64` (nullable) | `mix["battery storage"].discharge` |
 | `flow_exports_mw` | `Float64` | `mix.flows.exports` |
 | `flow_imports_mw` | `Float64` | `mix.flows.imports` |
-| `year` | `Int32` | Partition key (from datetime) |
+| `year` | `Int32` | Partition key |
 | `month` | `Int32` | Partition key |
 | `day` | `Int32` | Partition key |
 
 #### Silver Table: `electricity_flows`
 | Column | Type | Source |
 |---|---|---|
+| `process_ts` | `Int64` | Batch ID |
 | `zone` | `Utf8` | Top-level `zone` (FR) |
-| `datetime` | `Datetime(us, UTC)` | `history[].datetime` |
-| `updated_at` | `Datetime(us, UTC)` | `history[].updatedAt` |
+| `datetime` | `Datetime(us, UTC)` | `data[].datetime` |
+| `updated_at` | `Datetime(us, UTC)` | `data[].updatedAt` |
 | `neighbor_zone` | `Utf8` | Key from import/export dict |
 | `direction` | `Utf8` | `import` or `export` |
 | `power_mw` | `Float64` | Value (MW) |
@@ -454,41 +468,53 @@ Records that **fail to parse** (malformed JSON, unexpected schema) are written t
 ### Phase 4: Gold Layer
 
 #### Gold Table 1: `daily_electricity_mix`
-| Column | Type |
-|---|---|
-| `zone` | `Utf8` |
-| `zone_name` | `Utf8` ("France") |
-| `date` | `Date` |
-| `nuclear_pct` | `Float64` |
-| `biomass_pct` | `Float64` |
-| `wind_pct` | `Float64` |
-| `solar_pct` | `Float64` |
-| `hydro_pct` | `Float64` |
-| `gas_pct` | `Float64` |
-| `oil_pct` | `Float64` |
-| `coal_pct` | `Float64` |
-| `geothermal_pct` | `Float64` |
-| `unknown_pct` | `Float64` |
-| `total_production_mwh` | `Float64` |
-| `fossil_free_avg_pct` | `Float64` |
-| `renewable_avg_pct` | `Float64` |
-| `hours_covered` | `Int32` |
-| `year` | `Int32` |
-| `month` | `Int32` |
+| Column | Type | Description |
+|---|---|---|
+| `process_ts` | `Int64` | Batch ID |
+| `zone` | `Utf8` | E-maps Zone ID (FR) |
+| `zone_name` | `Utf8` | Human-friendly name (France) |
+| `date` | `Date` | Aggregation date |
+| `nuclear_pct` | `Float64` | Daily average % |
+| `biomass_pct` | `Float64` | Daily average % |
+| `wind_pct` | `Float64` | Daily average % |
+| `solar_pct` | `Float64` | Daily average % |
+| `hydro_pct` | `Float64` | Daily average % |
+| `gas_pct` | `Float64` | Daily average % |
+| `oil_pct` | `Float64` | Daily average % |
+| `coal_pct` | `Float64` | Daily average % |
+| `geothermal_pct` | `Float64` | Daily average % |
+| `unknown_pct` | `Float64` | Daily average % |
+| `total_production_mwh` | `Float64` | Sum of MW over 24h |
+| `fossil_free_avg_pct` | `Float64` | Daily average % |
+| `renewable_avg_pct` | `Float64` | Daily average % |
+| `hours_covered` | `Int32` | Data density (1-24) |
+| `year` / `month` / `day` | `Int32` | Partition keys |
 
 #### Gold Table 2: `daily_imports`
 | Column | Type |
 |---|---|
+| `process_ts` | `Int64` |
 | `zone` | `Utf8` |
 | `zone_name` | `Utf8` |
 | `source_zone` | `Utf8` |
+| `source_zone_name` | `Utf8` |
 | `date` | `Date` |
 | `import_mwh` | `Float64` |
 | `hours_covered` | `Int32` |
-| `year` / `month` | `Int32` |
+| `year` / `month` / `day` | `Int32` |
 
 #### Gold Table 3: `daily_exports`
-Same as imports but with `destination_zone` and `export_mwh`.
+| Column | Type |
+|---|---|
+| `process_ts` | `Int64` |
+| `zone` | `Utf8` |
+| `zone_name` | `Utf8` |
+| `destination_zone` | `Utf8` |
+| `destination_zone_name` | `Utf8` |
+| `date` | `Date` |
+| `export_mwh` | `Float64` |
+| `hours_covered` | `Int32` |
+| `year` / `month` / `day` | `Int32` |
 
 #### Gold Tasks
 | # | Task |
@@ -585,15 +611,15 @@ def pick_pending_and_process(upstream_layer: str, **kwargs):
 | 6.6 | GitHub Actions CI |
 | 6.7 | Sample outputs in `sample_outputs/` |
 
-### Phase 7: RAG Chatbot — Design + Working Notebook
+### Phase 7: RAG Chatbot — Hybrid Architecture
 | # | Task | Details |
 |---|---|---|
-| 7.1 | `docs/architecture.md` | High-level design: application + infrastructure layers |
-| 7.2 | Application layer diagram | FastAPI backend, Streamlit UI, LLM orchestrator |
-| 7.3 | Infrastructure layer diagram | S3, vector store, LLM service |
-| 7.4 | RAG pipeline design | Gold data embedding + doc chunking → vector search → LLM |
-| 7.5 | `notebooks/07_rag_chatbot.ipynb` | Working demo: embed Gold data → ChromaDB → query with LLM |
-| 7.6 | Example queries | "What % of France's electricity was nuclear yesterday?" |
+| 7.1 | `rag_architecture_design.md` | High-level design: application + infrastructure layers |
+| 7.2 | Router Agent | LangChain router to decide between "SQL" or "RAG" paths |
+| 7.3 | Text-to-SQL Agent | DuckDB connection with `httpfs` and `aws` extensions to query S3 Delta tables directly |
+| 7.4 | Document RAG | PyPDFLoader for docs, HuggingFace embeddings, ChromaDB vector store |
+| 7.5 | `notebooks/06_rag_chatbot.ipynb` | Working demo: embed docs → route queries → DuckDB SQL or Vector Search → Gemini LLM |
+| 7.6 | Example queries | "What is the average renewable percentage for France?" (SQL) vs "What is the methodology?" (RAG) |
 
 ### Phase 8: README & Polish
 | # | Task |
