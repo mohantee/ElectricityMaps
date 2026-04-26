@@ -26,8 +26,8 @@ def s3_client(aws_credentials):
 @pytest.fixture
 def test_settings(tmp_path):
     """Provides settings for tests using a local temporary directory for data.
-    
-    Using local paths avoids the 'Generic S3 error' when deltalake-rs tries 
+
+    Using local paths avoids the 'Generic S3 error' when deltalake-rs tries
     to access S3 in a mocked environment without a full moto server.
     """
     data_dir = tmp_path / "data"

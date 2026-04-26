@@ -28,13 +28,13 @@ def floor_to_hour(dt: datetime) -> datetime:
 
 def get_s3fs(settings: Settings) -> s3fs.S3FileSystem:
     """Build an authenticated S3FileSystem or LocalFileSystem based on settings.
-    
+
     If settings.emaps_data_dir is a local path (doesn't start with 's3://'),
     returns a LocalFileSystem for local storage/testing.
-    
+
     Args:
         settings: Pipeline settings containing AWS credentials or local path.
-        
+
     Returns:
         fsspec filesystem instance (S3FileSystem or LocalFileSystem).
     """
@@ -51,17 +51,17 @@ def get_s3fs(settings: Settings) -> s3fs.S3FileSystem:
 
 def read_bronze_parquet(s3_key: str, fs: s3fs.S3FileSystem) -> str:
     """Read a Bronze Parquet file and return the raw_json string.
-    
+
     Args:
         s3_key: Full S3 path to parquet file.
         fs: Authenticated S3FileSystem.
-        
+
     Returns:
         Raw JSON string from the first row's raw_json column.
     """
     with fs.open(s3_key, "rb") as f:
         df = pl.read_parquet(f)
-    return df["raw_json"][0]
+    return str(df["raw_json"][0])
 
 
 def find_bronze_files(
@@ -72,14 +72,14 @@ def find_bronze_files(
     fs: s3fs.S3FileSystem,
 ) -> list[str]:
     """Glob for Bronze Parquet files matching a process_ts.
-    
+
     Args:
         bronze_dir: Base S3 directory for bronze data.
         stream: Stream type (electricity_mix or electricity_flows).
         process_ts: Batch identifier to match.
         zone: Zone code to match.
         fs: Authenticated S3FileSystem.
-        
+
     Returns:
         List of full S3 paths matching the pattern.
     """
@@ -92,7 +92,7 @@ def find_bronze_files(
 
     if is_s3:
         return [f"s3://{f}" for f in files]
-    return files
+    return [str(f) for f in files]
 
 
 # ================================================================
@@ -101,28 +101,31 @@ def find_bronze_files(
 
 def read_delta_table(table_uri: str, storage_options: dict[str, str]) -> pl.DataFrame:
     """Read a Delta Lake table into a Polars DataFrame.
-    
+
     Args:
         table_uri: URI to the Delta table.
         storage_options: Storage connection options (e.g., S3 credentials).
-        
+
     Returns:
         Polars DataFrame with table contents, or empty DataFrame if table doesn't exist.
     """
     try:
         dt = DeltaTable(table_uri, storage_options=storage_options)
-        return pl.from_arrow(dt.to_pyarrow_table())
+        df = pl.from_arrow(dt.to_pyarrow_table())
+        if isinstance(df, pl.Series):
+            return df.to_frame()
+        return df
     except Exception:
         return pl.DataFrame()
 
 
 def filter_by_process_ts(df: pl.DataFrame, process_ts_values: list[int]) -> pl.DataFrame:
     """Filter a DataFrame to only rows matching specific process_ts values.
-    
+
     Args:
         df: Polars DataFrame with process_ts column.
         process_ts_values: List of process_ts values to include.
-        
+
     Returns:
         Filtered DataFrame.
     """
@@ -150,10 +153,10 @@ _ZONE_NAMES = {
 
 def get_zone_name(zone: str) -> str:
     """Get the human-readable name for a zone code.
-    
+
     Args:
         zone: Zone code (e.g., 'FR').
-        
+
     Returns:
         Zone name or the zone code if not found in mapping.
     """

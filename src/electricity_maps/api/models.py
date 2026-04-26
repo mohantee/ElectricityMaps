@@ -50,8 +50,8 @@ class MixData(BaseModel):
 
 class MixRecord(BaseModel):
     """A single hourly record in the electricity mix response."""
-    datetime: datetime
-    updated_at: datetime = Field(alias="updatedAt")
+    datetime: dt.datetime
+    updated_at: dt.datetime = Field(alias="updatedAt")
     is_estimated: bool | None = Field(None, alias="isEstimated")
     estimation_method: str | None = Field(None, alias="estimationMethod")
     mix: MixData
@@ -75,8 +75,8 @@ class ElectricityMixResponse(BaseModel):
 
 class FlowsRecord(BaseModel):
     """A single hourly record in the electricity flows response."""
-    datetime: datetime
-    updated_at: datetime = Field(alias="updatedAt")
+    datetime: dt.datetime
+    updated_at: dt.datetime = Field(alias="updatedAt")
     import_flows: dict[str, float] | None = Field(None, alias="import")
     export_flows: dict[str, float] | None = Field(None, alias="export")
 

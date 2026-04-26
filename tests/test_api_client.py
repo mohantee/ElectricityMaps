@@ -48,6 +48,5 @@ def test_api_client_auth_error(test_settings):
 def test_api_client_timeout(test_settings):
     """Negative scenario: API call times out."""
     with patch("httpx.Client.get", side_effect=httpx.TimeoutException("Timeout")), \
-         ElectricityMapsClient(test_settings) as client:
-        with pytest.raises(httpx.TimeoutException):
-            client.get_raw_mix_range("FR", datetime.now(UTC), datetime.now(UTC))
+         ElectricityMapsClient(test_settings) as client, pytest.raises(httpx.TimeoutException):
+        client.get_raw_mix_range("FR", datetime.now(UTC), datetime.now(UTC))

@@ -10,6 +10,7 @@ State machine per row: **I → R → P → C**
 
 from __future__ import annotations
 
+import typing as tp
 from datetime import UTC, datetime
 
 import polars as pl
@@ -69,7 +70,7 @@ class PipelineState:
                 "record_count": [None],
                 "error_message": [None],
             },
-            schema=_STATE_SCHEMA,
+            schema=tp.cast(tp.Any, _STATE_SCHEMA),
         )
         self._append(row)
 
@@ -174,7 +175,8 @@ class PipelineState:
         if layer.is_empty():
             return None
 
-        return layer["end_timestamp"].max()
+        val = layer["end_timestamp"].max()
+        return tp.cast(datetime, val) if val is not None else None
 
     def get_state_summary(self) -> pl.DataFrame:
         """Return the full ``el_state`` table for monitoring / debugging."""
@@ -191,10 +193,13 @@ class PipelineState:
                 self._table_uri,
                 storage_options=self._storage_options,
             )
-            return pl.from_arrow(dt.to_pyarrow_table())
+            df = pl.from_arrow(dt.to_pyarrow_table())
+            if isinstance(df, pl.Series):
+                return df.to_frame()
+            return df
         except Exception:
             # Table doesn't exist yet
-            return pl.DataFrame(schema=_STATE_SCHEMA)
+            return pl.DataFrame(schema=tp.cast(tp.Any, _STATE_SCHEMA))
 
     def _append(self, df: pl.DataFrame) -> None:
         """Append rows to the el_state Delta table (create if needed)."""

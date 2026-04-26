@@ -10,6 +10,7 @@ Features:
 from __future__ import annotations
 
 import logging
+import typing as tp
 from datetime import datetime
 
 import httpx
@@ -119,7 +120,7 @@ class ElectricityMapsClient:
             )
 
         response.raise_for_status()
-        return response.json()
+        return tp.cast(dict[tp.Any, tp.Any], response.json())
 
     # -- parsed (typed) endpoints ------------------------------------------
 

@@ -31,24 +31,8 @@ The solution is designed for analytics on energy transition trends and includes 
 
 ### High-level Diagram
 
-```mermaid
-flowchart LR
-    A[Electricity Maps API<br/>Mix + Flows] --> B[Bronze Layer<br/>Raw Parquet + Metadata]
-    B --> C[Silver Layer<br/>Clean Delta + Batch Parquet]
-    C --> D[Gold Layer<br/>Daily Data Products]
-    B --> E[el_state Delta<br/>I -> R -> P -> C]
-    C --> E
-    D --> E
-    D --> F[Analytics<br/>DuckDB + Notebooks]
-    D --> G[RAG Interface<br/>Router + SQL + Vector Retrieval]
-    H[Airflow DAGs<br/>Bronze/Silver/Gold] --> B
-    H --> C
-    H --> D
-    I[S3 Storage] --- B
-    I --- C
-    I --- D
-    I --- E
-```
+![High-level Architecture Diagram](./docs/images/architecture.png)
+
 
 The pipeline ingests hourly France electricity data, standardizes it through Bronze/Silver/Gold, and publishes analytics-ready daily datasets on S3.  
 Airflow orchestrates independent layer runs through `el_state`, while notebooks and the RAG layer consume Gold outputs for analysis and Q&A.
@@ -69,10 +53,10 @@ Airflow orchestrates independent layer runs through `el_state`, while notebooks 
 
 ```mermaid
 sequenceDiagram
-    participant B as Bronze DAG (@hourly)
-    participant S as Silver DAG (@hourly +10m)
-    participant G as Gold DAG (@hourly +20m)
-    participant ST as Delta Table: el_state
+    participant B as "Bronze DAG (@hourly)"
+    participant S as "Silver DAG (@hourly +10m)"
+    participant G as "Gold DAG (@hourly +20m)"
+    participant ST as "Delta Table: el_state"
 
     B->>ST: init_layer(bronze, status=I)
     B->>B: Fetch mix + flows (catch-up aware window)

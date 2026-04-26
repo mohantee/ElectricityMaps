@@ -14,8 +14,8 @@ import logging
 import time
 from datetime import UTC, datetime
 
-import polars as pl
 import pandera.polars as pa
+import polars as pl
 from deltalake import write_deltalake
 
 from electricity_maps.config import Settings, get_settings
