@@ -3,7 +3,6 @@
 Features:
 - Automatic retries with exponential backoff on 429 / 5xx / network errors
 - User-Agent header (required by Cloudflare)
-- Type-safe response parsing via Pydantic models
 - Raw-dict methods for Bronze layer (no parsing overhead)
 """
 
@@ -27,22 +26,15 @@ from electricity_maps.config import Settings, get_settings
 logger = logging.getLogger(__name__)
 
 
-# ------------------------------------------------------------------ #
-#  Custom exceptions                                                  #
-# ------------------------------------------------------------------ #
-
+#  Custom exceptions
 class RateLimitError(Exception):
     """Raised when the API returns 429 Too Many Requests."""
-
 
 class APIError(Exception):
     """Raised for non-retriable API errors (4xx except 429)."""
 
 
-# ------------------------------------------------------------------ #
-#  Retry predicate                                                    #
-# ------------------------------------------------------------------ #
-
+#  Retry predicate
 def _is_retriable(exc: BaseException) -> bool:
     """Return True for errors that warrant a retry."""
     if isinstance(exc, RateLimitError):
@@ -52,18 +44,15 @@ def _is_retriable(exc: BaseException) -> bool:
     return isinstance(exc, (httpx.ConnectError, httpx.TimeoutException))
 
 
-# ------------------------------------------------------------------ #
-#  Client                                                             #
-# ------------------------------------------------------------------ #
-
+# Client
 class ElectricityMapsClient:
     """Client for the Electricity Maps API v4.
 
     Usage::
 
         with ElectricityMapsClient() as client:
-            mix = client.get_mix_range("FR", start, end)
-            flows = client.get_flows_range("FR", start, end)
+            mix = client.get_raw_mix_range("FR", start, end)
+            flows = client.get_raw_flows_range("FR", start, end)
     """
 
     def __init__(self, settings: Settings | None = None) -> None:
@@ -77,8 +66,7 @@ class ElectricityMapsClient:
             timeout=30.0,
         )
 
-    # -- context manager --------------------------------------------------
-
+    # -- context manager --
     def close(self) -> None:
         self._client.close()
 
@@ -88,8 +76,7 @@ class ElectricityMapsClient:
     def __exit__(self, *args: object) -> None:
         self.close()
 
-    # -- internal request --------------------------------------------------
-
+    # -- internal request
     @retry(
         stop=stop_after_attempt(5),
         wait=wait_exponential(multiplier=1, min=2, max=60),
@@ -122,9 +109,6 @@ class ElectricityMapsClient:
         response.raise_for_status()
         return tp.cast(dict[tp.Any, tp.Any], response.json())
 
-    # -- parsed (typed) endpoints ------------------------------------------
-
-    # -- raw (untyped) endpoints for Bronze --------------------------------
 
     def get_raw_mix_range(
         self,

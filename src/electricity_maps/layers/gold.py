@@ -22,7 +22,7 @@ from electricity_maps.schemas.gold_schemas import (
     GoldImportsSchema,
     GoldMixSchema,
 )
-from electricity_maps.utils.helpers import filter_by_process_ts, get_zone_name, read_delta_table
+from electricity_maps.utils.helpers import filter_by_process_ts, get_zone_name
 from electricity_maps.utils.state import PipelineState
 
 logger = logging.getLogger(__name__)
@@ -181,13 +181,6 @@ def _filter_to_days(df: pl.DataFrame, days: list[tuple[int, int, int]]) -> pl.Da
     return df.filter(predicate)
 
 
-def _predicate_for_days(days: list[tuple[int, int, int]]) -> str | None:
-    """Build a SQL WHERE predicate for Delta Lake based on (year, month, day) tuples."""
-    if not days:
-        return None
-    return " OR ".join(f"(year = {year} AND month = {month} AND day = {day})" for year, month, day in days)
-
-
 def _delta_exists(table_uri: str, storage_options: dict[str, str]) -> bool:
     """Check if a Delta table exists."""
     try:
@@ -197,34 +190,105 @@ def _delta_exists(table_uri: str, storage_options: dict[str, str]) -> bool:
         return False
 
 
-def _merge_write_delta(
+def _read_delta_columns(
+    table_uri: str,
+    storage_options: dict[str, str],
+    columns: list[str],
+) -> pl.DataFrame:
+    """Read selected columns from a Delta table."""
+    try:
+        dt = DeltaTable(table_uri, storage_options=storage_options)
+        df = pl.from_arrow(dt.to_pyarrow_table(columns=columns))
+        if isinstance(df, pl.Series):
+            return df.to_frame()
+        return df
+    except Exception:
+        return pl.DataFrame()
+
+
+def _read_delta_for_days(
+    table_uri: str,
+    storage_options: dict[str, str],
+    days: list[tuple[int, int, int]],
+) -> pl.DataFrame:
+    """Read only requested (year, month, day) partitions from Delta table."""
+    if not days:
+        return pl.DataFrame()
+    try:
+        dt = DeltaTable(table_uri, storage_options=storage_options)
+    except Exception:
+        return pl.DataFrame()
+
+    frames: list[pl.DataFrame] = []
+    for year, month, day in days:
+        part_rows = dt.to_pyarrow_table(
+            partitions=[
+                ("year", "=", year),
+                ("month", "=", month),
+                ("day", "=", day),
+            ]
+        )
+        part_df = pl.from_arrow(part_rows)
+        if isinstance(part_df, pl.Series):
+            part_df = part_df.to_frame()
+        if not part_df.is_empty():
+            frames.append(part_df)
+
+    return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
+
+
+def _assert_unique_keys(df: pl.DataFrame, keys: list[str], label: str) -> None:
+    """Fail fast if duplicate business keys are present."""
+    if df.is_empty():
+        return
+    dupes = (
+        df.group_by(keys)
+        .len()
+        .filter(pl.col("len") > 1)
+    )
+    if not dupes.is_empty():
+        raise ValueError(f"{label} contains duplicate keys for {keys}")
+
+
+def _overwrite_affected_days(
     df: pl.DataFrame,
     table_uri: str,
     storage_options: dict[str, str],
+    days: list[tuple[int, int, int]],
+    key_cols: list[str],
     partition_by: list[str] | None = None,
 ) -> None:
-    """Write/append to a Delta table, creating it if needed."""
-    if df.is_empty():
+    """Overwrite only affected days by read-filter-union-overwrite."""
+    if not days:
         return
 
-    pa_table = df.to_arrow()
-    try:
-        write_deltalake(
-            table_uri,
-            pa_table,
-            mode="append",
-            partition_by=partition_by,
-            storage_options=storage_options,
-        )
-    except Exception:
-        # Table doesn't exist — create it
-        write_deltalake(
-            table_uri,
-            pa_table,
-            mode="overwrite",
-            partition_by=partition_by,
-            storage_options=storage_options,
-        )
+    if not df.is_empty():
+        _assert_unique_keys(df, key_cols, label="incoming_df")
+
+    day_filter = pl.DataFrame(
+        [{"year": y, "month": m, "day": d} for y, m, d in days],
+        schema={"year": pl.Int32, "month": pl.Int32, "day": pl.Int32},
+    )
+
+    if _delta_exists(table_uri, storage_options):
+        existing = pl.from_arrow(DeltaTable(table_uri, storage_options=storage_options).to_pyarrow_table())
+        if isinstance(existing, pl.Series):
+            existing = existing.to_frame()
+        remaining = existing.join(day_filter, on=["year", "month", "day"], how="anti")
+        merged = pl.concat([remaining, df], how="diagonal_relaxed") if not df.is_empty() else remaining
+    else:
+        merged = df
+
+    if merged.is_empty():
+        return
+    _assert_unique_keys(merged, key_cols, label="final_df")
+    write_deltalake(
+        table_uri,
+        merged.to_arrow(),
+        mode="overwrite",
+        partition_by=partition_by,
+        storage_options=storage_options,
+    )
 
 
 # ================================================================
@@ -261,16 +325,33 @@ def transform_gold(
     state.init_layer("gold", process_ts)
 
     try:
-        # Step 2: Read Silver Delta tables and identify claimed process_ts months
-        silver_mix_all = read_delta_table(f"{settings.silver_dir}/electricity_mix", so)
-        silver_flows_all = read_delta_table(f"{settings.silver_dir}/electricity_flows", so)
+        # Step 2: Read minimal Silver columns to identify affected days,
+        # then load only those partitions for full aggregation.
+        silver_mix_ts = _read_delta_columns(
+            f"{settings.silver_dir}/electricity_mix",
+            so,
+            ["process_ts", "year", "month", "day"],
+        )
+        silver_flows_ts = _read_delta_columns(
+            f"{settings.silver_dir}/electricity_flows",
+            so,
+            ["process_ts", "year", "month", "day"],
+        )
 
-        pending_mix = filter_by_process_ts(silver_mix_all, pending_ts)
-        pending_flows = filter_by_process_ts(silver_flows_all, pending_ts)
+        pending_mix = filter_by_process_ts(silver_mix_ts, pending_ts)
+        pending_flows = filter_by_process_ts(silver_flows_ts, pending_ts)
         affected_days = _affected_days(pending_mix, pending_flows)
 
-        silver_mix = _filter_to_days(silver_mix_all, affected_days)
-        silver_flows = _filter_to_days(silver_flows_all, affected_days)
+        silver_mix = _read_delta_for_days(
+            f"{settings.silver_dir}/electricity_mix",
+            so,
+            affected_days,
+        )
+        silver_flows = _read_delta_for_days(
+            f"{settings.silver_dir}/electricity_flows",
+            so,
+            affected_days,
+        )
 
         # Step 3: Aggregate and validate
         gold_mix = GoldMixSchema.validate(_aggregate_mix(silver_mix, process_ts))
@@ -286,22 +367,28 @@ def transform_gold(
         # Step 4: Write Delta Lake tables
         partition_cols = ["year", "month", "day"]
 
-        _merge_write_delta(
+        _overwrite_affected_days(
             gold_mix,
             f"{settings.gold_dir}/daily_electricity_mix",
             so,
+            affected_days,
+            key_cols=["zone", "date"],
             partition_by=partition_cols,
         )
-        _merge_write_delta(
+        _overwrite_affected_days(
             gold_imports,
             f"{settings.gold_dir}/daily_imports",
             so,
+            affected_days,
+            key_cols=["zone", "source_zone", "date"],
             partition_by=partition_cols,
         )
-        _merge_write_delta(
+        _overwrite_affected_days(
             gold_exports,
             f"{settings.gold_dir}/daily_exports",
             so,
+            affected_days,
+            key_cols=["zone", "destination_zone", "date"],
             partition_by=partition_cols,
         )
 

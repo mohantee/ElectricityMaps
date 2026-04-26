@@ -16,7 +16,7 @@ from datetime import UTC, datetime
 
 import pandera.polars as pa
 import polars as pl
-from deltalake import write_deltalake
+from deltalake import DeltaTable, write_deltalake
 
 from electricity_maps.config import Settings, get_settings
 from electricity_maps.schemas.silver_schemas import (
@@ -320,6 +320,68 @@ def _merge_write_delta(
         )
 
 
+def _delta_exists(table_uri: str, storage_options: dict[str, str]) -> bool:
+    """Check if a Delta table exists."""
+    try:
+        DeltaTable(table_uri, storage_options=storage_options)
+        return True
+    except Exception:
+        return False
+
+
+def _assert_unique_keys(df: pl.DataFrame, keys: list[str], label: str) -> None:
+    """Fail fast if duplicate business keys are present."""
+    if df.is_empty():
+        return
+    dupes = (
+        df.group_by(keys)
+        .len()
+        .filter(pl.col("len") > 1)
+    )
+    if not dupes.is_empty():
+        raise ValueError(f"{label} contains duplicate keys for {keys}")
+
+
+def _upsert_by_keys_overwrite(
+    df: pl.DataFrame,
+    table_uri: str,
+    storage_options: dict[str, str],
+    key_cols: list[str],
+    partition_by: list[str] | None = None,
+) -> None:
+    """Idempotent write using key-based replacement + table overwrite.
+
+    This provides MERGE-like behavior in environments where Delta merge/update
+    is not available on object storage.
+    """
+    if df.is_empty():
+        return
+
+    _assert_unique_keys(df, key_cols, label="incoming_df")
+
+    if _delta_exists(table_uri, storage_options):
+        existing = pl.from_arrow(
+            DeltaTable(table_uri, storage_options=storage_options).to_pyarrow_table()
+        )
+        if isinstance(existing, pl.Series):
+            existing = existing.to_frame()
+
+        # Keep only existing rows whose keys are not present in incoming rows.
+        remaining = existing.join(df.select(key_cols), on=key_cols, how="anti")
+        merged = pl.concat([remaining, df], how="diagonal_relaxed")
+    else:
+        merged = df
+
+    _assert_unique_keys(merged, key_cols, label="final_df")
+    write_deltalake(
+        table_uri,
+        merged.to_arrow(),
+        mode="overwrite",
+        partition_by=partition_by,
+        storage_options=storage_options,
+    )
+
+
 # ------------------------------------------------------------------ #
 #  Main entry point                                                   #
 # ------------------------------------------------------------------ #
@@ -408,16 +470,18 @@ def transform_silver(
         so = settings.storage_options
         partition_cols = ["year", "month", "day"]
 
-        _merge_write_delta(
+        _upsert_by_keys_overwrite(
             mix_df,
             f"{settings.silver_dir}/electricity_mix",
             so,
+            key_cols=["zone", "datetime"],
             partition_by=partition_cols,
         )
-        _merge_write_delta(
+        _upsert_by_keys_overwrite(
             flows_df,
             f"{settings.silver_dir}/electricity_flows",
             so,
+            key_cols=["zone", "datetime", "neighbor_zone", "direction"],
             partition_by=partition_cols,
         )
 

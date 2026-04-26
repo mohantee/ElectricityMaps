@@ -6,7 +6,6 @@
 |---|---|---|
 | Framework | **Polars + Delta-RS** | Fastest single-node, no JVM, native Delta support |
 | HTTP Client | **httpx + tenacity** | Retries, rate-limit handling |
-| API Validation | **Pydantic v2** | Type-safe API response models |
 | DF Validation | **Pandera (polars)** | DataFrame-level schema contracts |
 | Config | **pydantic-settings** | Typed `.env` config |
 | Orchestration | **Apache Airflow** | Industry-standard ETL scheduler |
@@ -235,8 +234,7 @@ ElectricityMaps/
 │       ├── config.py                  # Loads env-specific config
 │       ├── api/
 │       │   ├── __init__.py
-│       │   ├── client.py
-│       │   └── models.py
+│       │   └── client.py
 │       ├── layers/
 │       │   ├── __init__.py
 │       │   ├── bronze.py
@@ -365,11 +363,11 @@ __pycache__/
 ### Phase 1: API Client
 | # | Task | Details |
 |---|---|---|
-| 1.1 | Pydantic v2 models | Models for mix & flows `past-range` responses (nested storage, nullables) |
+| 1.1 | (Removed) | Pydantic models removed to minimize ingestion overhead |
 | 1.2 | `ElectricityMapsClient` class | httpx-based, `User-Agent` header (required for Cloudflare) |
 | 1.3 | Retry logic | tenacity: exponential backoff, retry on 429/5xx |
-| 1.4 | `get_mix_range(zone, start, end)` | `/v4/electricity-mix/past-range` → raw JSON dict |
-| 1.5 | `get_flows_range(zone, start, end)` | `/v4/electricity-flows/past-range` → raw JSON dict |
+| 1.4 | `get_raw_mix_range(zone, start, end)` | `/v4/electricity-mix/past-range` → raw JSON dict |
+| 1.5 | `get_raw_flows_range(zone, start, end)` | `/v4/electricity-flows/past-range` → raw JSON dict |
 
 ### Phase 2: Bronze Layer
 | # | Task | Details |
@@ -377,7 +375,7 @@ __pycache__/
 | 2.1 | `ingest_bronze(zone, process_ts)` | Main entry point |
 | 2.2 | Write `el_state` entry (status=I) with process_ts | Via utils.py |
 | 2.3 | Calculate time range | `start` = last bronze `process_ts` from `el_state` (floor to hour), `end` = current hour start |
-| 2.4 | Call both API endpoints | `get_mix_range(zone, start, end)` + `get_flows_range(zone, start, end)` |
+| 2.4 | Call both API endpoints | `get_raw_mix_range(zone, start, end)` + `get_raw_flows_range(zone, start, end)` |
 | 2.5 | Add metadata envelope | `_ingestion_timestamp`, `_source_url`, `_zone`, `_start`, `_end` |
 | 2.6 | Store as parquet files | `bronze/{stream}/year=YYYY/month=MM/day=DD/{zone}_{process_ts}.parquet` |
 | 2.7 | Update `el_state` to R | With record_count |

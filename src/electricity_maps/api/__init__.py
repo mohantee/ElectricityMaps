@@ -1,13 +1,7 @@
-"""Electricity Maps API client and response models."""
+"""Electricity Maps API client."""
 
 from electricity_maps.api.client import ElectricityMapsClient
-from electricity_maps.api.models import (
-    ElectricityFlowsResponse,
-    ElectricityMixResponse,
-)
 
 __all__ = [
-    "ElectricityFlowsResponse",
     "ElectricityMapsClient",
-    "ElectricityMixResponse",
 ]
