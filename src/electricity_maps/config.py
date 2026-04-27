@@ -13,11 +13,9 @@ from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # ---------------------------------------------------------------------------
-# Resolve the env file path *once* at import time based on EMAPS_ENV
+# Project root resolution
 # ---------------------------------------------------------------------------
-_ENV = os.getenv("EMAPS_ENV", "prod")
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
-_ENV_FILE = str(_PROJECT_ROOT / "config" / f"env_{_ENV}.properties")
 
 
 class Settings(BaseSettings):
@@ -29,7 +27,6 @@ class Settings(BaseSettings):
     """
 
     model_config = SettingsConfigDict(
-        env_file=_ENV_FILE,
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -98,7 +95,12 @@ class Settings(BaseSettings):
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     """Return a cached ``Settings`` instance and auto-configure logging."""
-    settings = Settings()
+    env = os.getenv("EMAPS_ENV", "prod")
+    project_root = Path(__file__).resolve().parents[2]
+    env_file = project_root / "config" / f"env_{env}.properties"
+
+    # Load settings from the environment-specific properties file
+    settings = Settings(_env_file=str(env_file))
     setup_logging(settings.emaps_log_level)
     return settings
 
