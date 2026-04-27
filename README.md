@@ -24,7 +24,7 @@ The solution is designed for analytics on energy transition trends and includes 
 | Orchestration pattern | Decoupled Airflow DAGs + `el_state` state machine (`I -> R -> P -> C`) | Enables independent layer scheduling while preserving deterministic handoff and status tracking. |
 | Storage strategy | S3-backed Delta tables | Fast, reliable ACID transactions on S3 using Polars + Delta-rs. |
 | Deployment scope | Single-node deployment with Docker + Docker Compose | Keeps operations simple for assignment scale while remaining reproducible and easy to run end-to-end. |
-| Validation and DQ | Pydantic for API contracts + Pandera for DataFrames + bad-data tables | Enforces typed schemas and captures parse/schema failures without stopping valid data flow. |
+| Validation and DQ | Pydantic (config) + Pandera (DataFrames) + bad_data tables | Enforces typed settings and schema contracts while keeping data ingestion lightweight. |
 | Reliability | HTTP retry/backoff, stateful error recording, CI gate | Handles rate limits/transient failures and improves operational confidence before deployment. |
 
 ## Architecture
@@ -35,7 +35,7 @@ The solution is designed for analytics on energy transition trends and includes 
 
 
 The pipeline ingests hourly France electricity data, standardizes it through Bronze/Silver/Gold, and publishes analytics-ready daily datasets on S3.  
-Airflow orchestrates independent layer runs through `el_state`, while notebooks and the RAG layer consume Gold outputs for analysis and Q&A.
+Airflow orchestrates independent layer runs through `el_state`, Analytics and the RAG layer consumes data from Gold tables to provide insights and answer questions about the data.
 
 ### High-level Components
 
@@ -44,9 +44,9 @@ Airflow orchestrates independent layer runs through `el_state`, while notebooks 
   - Bronze Delta Table (Raw envelope)
   - Silver Delta Tables (Cleaned/Flattened)
   - Gold Delta Tables (Aggregated Business Products)
-  - `state/el_state` Delta table for process tracking
+  - `state/el_state` State Management table for process tracking
 - **Orchestration**: 3 decoupled Airflow DAGs
-- **Analytics**: DuckDB notebook queries on Delta tables
+- **Analytics**: Notebook queries on Delta tables
 - **RAG design**: see [`rag_architecture_design.md`](./rag_architecture_design.md) (uses Google Generative AI embeddings)
 
 ### Layer Sequence Diagram
@@ -160,7 +160,7 @@ transform_gold()
 - [`02_bronze_ingestion.ipynb`](./notebooks/02_bronze_ingestion.ipynb): test bronze ingest
 - [`03_silver_transform.ipynb`](./notebooks/03_silver_transform.ipynb): test silver transformation
 - [`04_gold_aggregation.ipynb`](./notebooks/04_gold_aggregation.ipynb): test gold transformation
-- [`05_query_delta_sql.ipynb`](./notebooks/05_query_delta_sql.ipynb): Query util: to inspect the data in S3
+- [`05_query_delta_sql.ipynb`](./notebooks/05_query_delta_sql.ipynb): Query util to inspect the data in S3
 - [`06_rag_chatbot.ipynb`](./notebooks/06_rag_chatbot.ipynb): hybrid SQL + document RAG demo
 
 ## Data Layer Schemas (Required Submission Item)

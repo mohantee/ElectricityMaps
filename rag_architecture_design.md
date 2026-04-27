@@ -21,7 +21,7 @@ Design details of the chat-bot assistant for Electricity Maps use cases:
 ### Core Components
 
 - **Router (`SQL` vs `RAG`)**: Classifies user intent into `SQL`, `RAG`, or `CLARIFY`.
-- **Text-to-SQL path**: LLM generates constrained SQL from known schema; DuckDB executes against Gold Delta.
+- **Text-to-SQL path**: LLM generates constrained SQL from known schema; executes SQL against Gold Delta.
 - **RAG path**: Embedding-based retrieval returns top chunks; LLM answers strictly from retrieved context.
 - **Response composer**: Normalizes output format, confidence notes, citations, and fallback behaviors.
 
