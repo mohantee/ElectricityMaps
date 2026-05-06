@@ -73,7 +73,7 @@ This is the ingestion/indexing approach for unstructured sources. We will build 
 
 ### Step D: Embedding and Indexing
 
-- Generate embeddings using GoogleGenerativeAIEmbeddings `text-embedding-004`.
+- Generate embeddings using `HuggingFaceEmbeddings` with `sentence-transformers/all-MiniLM-L6-v2` in the current prototype.
 - Upsert embeddings into Chroma collection with chunk metadata.
 - Use deterministic IDs to make re-indexing idempotent.
 
@@ -109,7 +109,7 @@ Routing policy:
   - no DDL/DML
   - only known tables/columns
   - bounded result size (`LIMIT`)
-- Execute via DuckDB on Gold Delta data, then pass result rows to answer composer.
+- Execute via Polars `SQLContext` on Gold Delta data, then pass result rows to answer composer.
 
 ### RAG Route Contract
 
@@ -172,8 +172,8 @@ High (direct aggregate from Gold table).
 
 `notebooks/06_rag_chatbot.ipynb` should map to this architecture using:
 
-- `router_chain` -> route classification (`SQL`/`RAG`/`CLARIFY`)
+- `router_chain` -> route classification (`SQL`/`RAG`)
 - `sql_chain` -> constrained Text-to-SQL generation
-- `duckdb` executor -> Gold table query execution
+- `Polars SQLContext` executor -> Gold table query execution
 - `rag_chain` + Chroma retriever -> document-grounded QA
 - `ask_chatbot` -> unified response formatting, citations, and fallback handling
